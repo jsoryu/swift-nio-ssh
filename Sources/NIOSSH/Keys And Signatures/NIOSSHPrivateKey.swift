@@ -13,6 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 @preconcurrency import Crypto
+import _CryptoExtras
 import NIOCore
 
 #if canImport(FoundationEssentials)
@@ -52,6 +53,15 @@ public struct NIOSSHPrivateKey: Sendable {
         self.backingKey = .ecdsaP521(key)
     }
 
+    /// Create a private key from an RSA key.
+    ///
+    /// RSA support exists for interoperability with existing deployments. Signatures
+    /// use rsa-sha2-256/rsa-sha2-512 only (RFC 8332); ssh-rsa/SHA-1 is never produced.
+    /// For new deployments prefer Ed25519 or ECDSA keys.
+    public init(rsaKey key: _RSA.Signing.PrivateKey) {
+        self.backingKey = .rsa(key)
+    }
+
     #if canImport(Darwin)
     public init(secureEnclaveP256Key key: SecureEnclave.P256.Signing.PrivateKey) {
         self.backingKey = .secureEnclaveP256(key)
@@ -69,6 +79,10 @@ public struct NIOSSHPrivateKey: Sendable {
             return ["ecdsa-sha2-nistp384"]
         case .ecdsaP521:
             return ["ecdsa-sha2-nistp521"]
+        case .rsa:
+            // rsa-sha2-512 preferred over rsa-sha2-256 (RFC 8332). Deliberately no
+            // ssh-rsa (SHA-1) entry: we never offer or accept SHA-1 RSA.
+            return ["rsa-sha2-512", "rsa-sha2-256"]
         #if canImport(Darwin)
         case .secureEnclaveP256:
             return ["ecdsa-sha2-nistp256"]
@@ -84,6 +98,7 @@ extension NIOSSHPrivateKey {
         case ecdsaP256(P256.Signing.PrivateKey)
         case ecdsaP384(P384.Signing.PrivateKey)
         case ecdsaP521(P521.Signing.PrivateKey)
+        case rsa(_RSA.Signing.PrivateKey)
 
         #if canImport(Darwin)
         case secureEnclaveP256(SecureEnclave.P256.Signing.PrivateKey)
@@ -114,6 +129,18 @@ extension NIOSSHPrivateKey {
                 try key.signature(for: ptr)
             }
             return NIOSSHSignature(backingSignature: .ecdsaP521(signature))
+        case .rsa(let key):
+            // RSA signs the digest directly with PKCS#1 v1.5 padding (RFC 8332). The
+            // signature-algorithm tag follows the digest width; SHA-1 is never emitted.
+            let signature = try key.signature(for: digest, padding: .insecurePKCS1v1_5)
+            switch DigestBytes.byteCount {
+            case SHA256.byteCount:
+                return NIOSSHSignature(backingSignature: .rsaSHA256(signature))
+            default:
+                // SHA-512, or any other width (e.g. SHA-384, which has no SSH RSA name):
+                // fall back to the strongest available, rsa-sha2-512.
+                return NIOSSHSignature(backingSignature: .rsaSHA512(signature))
+            }
 
         #if canImport(Darwin)
         case .secureEnclaveP256(let key):
@@ -125,7 +152,9 @@ extension NIOSSHPrivateKey {
         }
     }
 
-    func sign(_ payload: UserAuthSignablePayload) throws -> NIOSSHSignature {
+    func sign(_ payload: UserAuthSignablePayload, rsaSignatureAlgorithm: RSASignatureAlgorithm = .sha512) throws
+        -> NIOSSHSignature
+    {
         switch self.backingKey {
         case .ed25519(let key):
             let signature = try key.signature(for: payload.bytes.readableBytesView)
@@ -139,6 +168,21 @@ extension NIOSSHPrivateKey {
         case .ecdsaP521(let key):
             let signature = try key.signature(for: payload.bytes.readableBytesView)
             return NIOSSHSignature(backingSignature: .ecdsaP521(signature))
+        case .rsa(let key):
+            // Hash the signable payload with the negotiated SHA-2 variant, then sign
+            // with PKCS#1 v1.5 padding (RFC 8332). Only rsa-sha2-256/512 are reachable;
+            // there is no SHA-1 path.
+            let bytesView = payload.bytes.readableBytesView
+            switch rsaSignatureAlgorithm {
+            case .sha512:
+                let digest = SHA512.hash(data: bytesView)
+                let signature = try key.signature(for: digest, padding: .insecurePKCS1v1_5)
+                return NIOSSHSignature(backingSignature: .rsaSHA512(signature))
+            case .sha256:
+                let digest = SHA256.hash(data: bytesView)
+                let signature = try key.signature(for: digest, padding: .insecurePKCS1v1_5)
+                return NIOSSHSignature(backingSignature: .rsaSHA256(signature))
+            }
         #if canImport(Darwin)
         case .secureEnclaveP256(let key):
             let signature = try key.signature(for: payload.bytes.readableBytesView)
@@ -160,6 +204,8 @@ extension NIOSSHPrivateKey {
             return NIOSSHPublicKey(backingKey: .ecdsaP384(privateKey.publicKey))
         case .ecdsaP521(let privateKey):
             return NIOSSHPublicKey(backingKey: .ecdsaP521(privateKey.publicKey))
+        case .rsa(let privateKey):
+            return NIOSSHPublicKey(backingKey: .rsa(privateKey.publicKey))
         #if canImport(Darwin)
         case .secureEnclaveP256(let privateKey):
             return NIOSSHPublicKey(backingKey: .ecdsaP256(privateKey.publicKey))

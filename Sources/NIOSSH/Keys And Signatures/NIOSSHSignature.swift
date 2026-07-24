@@ -13,6 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 @preconcurrency import Crypto
+import _CryptoExtras
 import Foundation
 import NIOCore
 import NIOFoundationCompat
@@ -42,6 +43,11 @@ extension NIOSSHSignature {
 
         case ecdsaP521(P521.Signing.ECDSASignature)
 
+        // RSA signatures (RFC 8332). Only the SHA-2 variants are supported;
+        // there is deliberately no ssh-rsa/SHA-1 case.
+        case rsaSHA256(_RSA.Signing.RSASignature)  // rsa-sha2-256
+        case rsaSHA512(_RSA.Signing.RSASignature)  // rsa-sha2-512
+
         internal enum RawBytes {
             case byteBuffer(ByteBuffer)
             case data(Data)
@@ -59,6 +65,12 @@ extension NIOSSHSignature {
 
     /// The prefix of a P521 ECDSA public key.
     fileprivate static let ecdsaP521SignaturePrefix = "ecdsa-sha2-nistp521".utf8
+
+    /// The prefix of an RSA signature using SHA-256 (`rsa-sha2-256`, RFC 8332).
+    internal static let rsaSHA256SignaturePrefix = "rsa-sha2-256".utf8
+
+    /// The prefix of an RSA signature using SHA-512 (`rsa-sha2-512`, RFC 8332).
+    internal static let rsaSHA512SignaturePrefix = "rsa-sha2-512".utf8
 }
 
 extension NIOSSHSignature.BackingSignature.RawBytes: Equatable {
@@ -93,10 +105,16 @@ extension NIOSSHSignature.BackingSignature: Equatable {
             return lhs.rawRepresentation == rhs.rawRepresentation
         case (.ecdsaP521(let lhs), .ecdsaP521(let rhs)):
             return lhs.rawRepresentation == rhs.rawRepresentation
+        case (.rsaSHA256(let lhs), .rsaSHA256(let rhs)):
+            return lhs.rawRepresentation == rhs.rawRepresentation
+        case (.rsaSHA512(let lhs), .rsaSHA512(let rhs)):
+            return lhs.rawRepresentation == rhs.rawRepresentation
         case (.ed25519, _),
             (.ecdsaP256, _),
             (.ecdsaP384, _),
-            (.ecdsaP521, _):
+            (.ecdsaP521, _),
+            (.rsaSHA256, _),
+            (.rsaSHA512, _):
             return false
         }
     }
@@ -117,6 +135,12 @@ extension NIOSSHSignature.BackingSignature: Hashable {
         case .ecdsaP521(let sig):
             hasher.combine(3)
             hasher.combine(sig.rawRepresentation)
+        case .rsaSHA256(let sig):
+            hasher.combine(4)
+            hasher.combine(sig.rawRepresentation)
+        case .rsaSHA512(let sig):
+            hasher.combine(5)
+            hasher.combine(sig.rawRepresentation)
         }
     }
 }
@@ -134,6 +158,10 @@ extension ByteBuffer {
             return self.writeECDSAP384Signature(baseSignature: sig)
         case .ecdsaP521(let sig):
             return self.writeECDSAP521Signature(baseSignature: sig)
+        case .rsaSHA256(let sig):
+            return self.writeRSASignature(baseSignature: sig, prefix: NIOSSHSignature.rsaSHA256SignaturePrefix)
+        case .rsaSHA512(let sig):
+            return self.writeRSASignature(baseSignature: sig, prefix: NIOSSHSignature.rsaSHA512SignaturePrefix)
         }
     }
 
@@ -212,6 +240,14 @@ extension ByteBuffer {
         return writtenLength
     }
 
+    private mutating func writeRSASignature(baseSignature: _RSA.Signing.RSASignature, prefix: String.UTF8View) -> Int {
+        // RSA signature wire format: the algorithm-name string followed by the raw
+        // signature bytes (RFC 8332). The signature is already the exact modulus width.
+        var writtenLength = self.writeSSHString(prefix)
+        writtenLength += self.writeSSHString(baseSignature.rawRepresentation)
+        return writtenLength
+    }
+
     mutating func readSSHSignature() throws -> NIOSSHSignature? {
         try self.rewindOnNilOrError { buffer in
             // The wire format always begins with an SSH string containing the signature format identifier. Let's grab that.
@@ -229,8 +265,14 @@ extension ByteBuffer {
                 return try buffer.readECDSAP384Signature()
             } else if bytesView.elementsEqual(NIOSSHSignature.ecdsaP521SignaturePrefix) {
                 return try buffer.readECDSAP521Signature()
+            } else if bytesView.elementsEqual(NIOSSHSignature.rsaSHA256SignaturePrefix) {
+                return try buffer.readRSASignature(variant: .sha256)
+            } else if bytesView.elementsEqual(NIOSSHSignature.rsaSHA512SignaturePrefix) {
+                return try buffer.readRSASignature(variant: .sha512)
             } else {
-                // We don't know this signature type.
+                // We don't know this signature type. Note that an "ssh-rsa" (SHA-1)
+                // signature deliberately has no arm above and lands here: SHA-1 RSA
+                // signatures are refused on read.
                 let signature =
                     signatureIdentifierBytes.readString(length: signatureIdentifierBytes.readableBytes)
                     ?? "<unknown signature>"
@@ -314,6 +356,33 @@ extension ByteBuffer {
             backingSignature: .ecdsaP521(ECDSASignatureHelper.toECDSASignature(r: rBytes, s: sBytes))
         )
     }
+
+    private enum RSASignatureVariant {
+        case sha256
+        case sha512
+    }
+
+    /// A helper function that reads an RSA signature.
+    ///
+    /// The signature is a single SSH string of raw (modulus-width) bytes. `_RSA`
+    /// validates the length and padding at verification time.
+    ///
+    /// Not safe to call from arbitrary code as this does not return the reader index on failure: it relies on the caller performing
+    /// the rewind.
+    private mutating func readRSASignature(variant: RSASignatureVariant) throws -> NIOSSHSignature? {
+        guard let sigBytes = self.readSSHString() else {
+            return nil
+        }
+
+        let signature = _RSA.Signing.RSASignature(rawRepresentation: Data(sigBytes.readableBytesView))
+
+        switch variant {
+        case .sha256:
+            return NIOSSHSignature(backingSignature: .rsaSHA256(signature))
+        case .sha512:
+            return NIOSSHSignature(backingSignature: .rsaSHA512(signature))
+        }
+    }
 }
 
 /// A structure that helps store ECDSA signatures on the stack temporarily to avoid unnecessary memory allocation.
@@ -369,7 +438,7 @@ private struct ECDSASignatureHelper {
 extension ByteBuffer {
     // A view onto the mpInt bytes. Strips off a leading 0 if it is present for
     // size reasons.
-    fileprivate var mpIntView: ByteBufferView {
+    internal var mpIntView: ByteBufferView {
         var baseView = self.readableBytesView
         if baseView.first == 0 {
             baseView = baseView.dropFirst()

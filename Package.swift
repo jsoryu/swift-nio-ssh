@@ -49,6 +49,9 @@ let package = Package(
                 .product(name: "NIOConcurrencyHelpers", package: "swift-nio"),
                 .product(name: "NIOFoundationCompat", package: "swift-nio"),
                 .product(name: "Crypto", package: "swift-crypto"),
+                // _CryptoExtras provides swift-crypto's RSA implementation (_RSA),
+                // used for rsa-sha2-256/512 public-key authentication (RFC 8332).
+                .product(name: "_CryptoExtras", package: "swift-crypto"),
                 .product(name: "Atomics", package: "swift-atomics"),
             ],
             swiftSettings: swiftSettings
@@ -91,6 +94,8 @@ let package = Package(
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOEmbedded", package: "swift-nio"),
                 .product(name: "NIOFoundationCompat", package: "swift-nio"),
+                // Needed for the RSA (_RSA) sign/verify unit tests.
+                .product(name: "_CryptoExtras", package: "swift-crypto"),
             ],
             swiftSettings: swiftSettings
         ),

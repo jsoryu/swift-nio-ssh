@@ -359,8 +359,45 @@ extension NIOSSHCertifiedPublicKey {
             return Self.p384KeyPrefix
         case .ecdsaP521:
             return Self.p521KeyPrefix
+        case .rsa:
+            // RSA certificates are out of scope; SSHCertificate parsing rejects RSA
+            // certs before this point, so this arm is unreachable.
+            preconditionFailure("RSA certificates are not currently supported")
         case .certified:
             preconditionFailure("base key cannot be certified")
+        }
+    }
+
+    /// The user-auth signature-algorithm prefix for a certified key's base key.
+    ///
+    /// Mirrors ``NIOSSHPublicKey/signatureAlgorithmPrefix`` so that certified keys can
+    /// delegate to their base key. RSA certificates are unsupported.
+    internal var signatureAlgorithmPrefix: String.UTF8View {
+        switch self.key.backingKey {
+        case .ed25519:
+            return Self.ed25519KeyPrefix
+        case .ecdsaP256:
+            return Self.p256KeyPrefix
+        case .ecdsaP384:
+            return Self.p384KeyPrefix
+        case .ecdsaP521:
+            return Self.p521KeyPrefix
+        case .rsa:
+            preconditionFailure("RSA certificates are not currently supported")
+        case .certified:
+            preconditionFailure("base key cannot be certified")
+        }
+    }
+
+    /// Returns the user-auth algorithm name for a certified key, honouring the RSA choice.
+    ///
+    /// RSA certificates are unsupported, so this always returns ``signatureAlgorithmPrefix``.
+    internal func algorithmName(forRSA rsaAlgorithm: RSASignatureAlgorithm) -> String.UTF8View {
+        switch self.key.backingKey {
+        case .rsa:
+            preconditionFailure("RSA certificates are not currently supported")
+        default:
+            return self.signatureAlgorithmPrefix
         }
     }
 

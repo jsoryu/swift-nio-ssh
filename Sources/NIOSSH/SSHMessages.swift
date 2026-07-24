@@ -149,7 +149,10 @@ extension SSHMessage {
         }
 
         enum PublicKeyAuthType: Equatable {
-            case known(key: NIOSSHPublicKey, signature: NIOSSHSignature?)
+            // `rsaSignatureAlgorithm` records the negotiated RSA signature algorithm
+            // (rsa-sha2-256/512). It is meaningful only for RSA keys; for other key
+            // types it is carried but ignored.
+            case known(key: NIOSSHPublicKey, signature: NIOSSHSignature?, rsaSignatureAlgorithm: RSASignatureAlgorithm)
             case unknown
         }
 
@@ -694,9 +697,29 @@ extension ByteBuffer {
                         return nil
                     }
 
-                    guard algorithmName.readableBytesView.elementsEqual(publicKey.keyPrefix) else {
+                    // Consistency check between the algorithm name and the key. For most
+                    // key types the algorithm name equals the key-blob prefix. RSA is the
+                    // RFC 8332 exception: the key prefix stays "ssh-rsa" while the algorithm
+                    // name is "rsa-sha2-256"/"rsa-sha2-512". Accept that decoupling for RSA
+                    // keys (an "ssh-rsa"/SHA-1 name maps to nil above and is already rejected
+                    // by the knownAlgorithms gate, so it never reaches here).
+                    let algorithmNameView = algorithmName.readableBytesView
+                    let rsaSignatureAlgorithm = RSASignatureAlgorithm(algorithmName: algorithmNameView)
+                    let algorithmMatchesKey: Bool
+                    if algorithmNameView.elementsEqual(publicKey.keyPrefix) {
+                        algorithmMatchesKey = true
+                    } else if publicKey.keyPrefix.elementsEqual(NIOSSHPublicKey.rsaPublicKeyPrefix) {
+                        algorithmMatchesKey = rsaSignatureAlgorithm != nil
+                    } else {
+                        algorithmMatchesKey = false
+                    }
+                    guard algorithmMatchesKey else {
                         throw NIOSSHError.invalidSSHMessage(reason: "algorithm and key mismatch in user auth request")
                     }
+
+                    // Default to rsa-sha2-512 if the key is RSA but the name was somehow
+                    // absent; irrelevant for non-RSA keys.
+                    let rsaAlgorithm = rsaSignatureAlgorithm ?? .sha512
 
                     if expectSignature {
                         guard var signatureBytes = self.readSSHString(),
@@ -705,9 +728,13 @@ extension ByteBuffer {
                             return nil
                         }
 
-                        method = .publicKey(.known(key: publicKey, signature: signature))
+                        method = .publicKey(
+                            .known(key: publicKey, signature: signature, rsaSignatureAlgorithm: rsaAlgorithm)
+                        )
                     } else {
-                        method = .publicKey(.known(key: publicKey, signature: nil))
+                        method = .publicKey(
+                            .known(key: publicKey, signature: nil, rsaSignatureAlgorithm: rsaAlgorithm)
+                        )
                     }
                 } else {
                     // This is not an algorithm we know. Consume the signature if we're expecting it.
@@ -770,8 +797,19 @@ extension ByteBuffer {
                 return nil
             }
 
-            // Validate consistency here.
-            guard publicKeyType.readableBytesView.elementsEqual(publicKey.keyPrefix) else {
+            // Validate consistency here. As in the user-auth request, RSA decouples the
+            // signature-algorithm name (rsa-sha2-256/512) from the ssh-rsa key prefix
+            // (RFC 8332), so accept a valid rsa-sha2 name for an RSA key.
+            let publicKeyTypeView = publicKeyType.readableBytesView
+            let keyTypeMatches: Bool
+            if publicKeyTypeView.elementsEqual(publicKey.keyPrefix) {
+                keyTypeMatches = true
+            } else if publicKey.keyPrefix.elementsEqual(NIOSSHPublicKey.rsaPublicKeyPrefix) {
+                keyTypeMatches = RSASignatureAlgorithm(algorithmName: publicKeyTypeView) != nil
+            } else {
+                keyTypeMatches = false
+            }
+            guard keyTypeMatches else {
                 throw NIOSSHError.invalidSSHMessage(reason: "inconsistent key type")
             }
 
@@ -1370,10 +1408,11 @@ extension ByteBuffer {
             writtenBytes += self.writeSSHString("password".utf8)
             writtenBytes += self.writeSSHBoolean(false)
             writtenBytes += self.writeSSHString(password.utf8)
-        case .publicKey(.known(key: let key, signature: let signature)):
+        case .publicKey(.known(key: let key, signature: let signature, rsaSignatureAlgorithm: let rsaAlgorithm)):
             writtenBytes += self.writeSSHString("publickey".utf8)
             writtenBytes += self.writeSSHBoolean(signature != nil)
-            writtenBytes += self.writeSSHString(key.keyPrefix)
+            // Write the signature-algorithm name (rsa-sha2-* for RSA, key prefix otherwise).
+            writtenBytes += self.writeSSHString(key.algorithmName(forRSA: rsaAlgorithm))
             writtenBytes += self.writeCompositeSSHString { buffer in
                 buffer.writeSSHHostKey(key)
             }
