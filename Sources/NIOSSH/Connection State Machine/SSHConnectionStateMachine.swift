@@ -1051,6 +1051,13 @@ struct SSHConnectionStateMachine {
                 return
             case .ignore, .debug, .unimplemented:
                 try state.serializer.serialize(message: message, to: &buffer)
+            case .userAuthInfoResponse:
+                // A keyboard-interactive INFO_RESPONSE resolved late, after the server already drove
+                // us into an authenticated (active) connection with USERAUTH_SUCCESS. This is the
+                // pipelined-INFO_REQUEST-then-SUCCESS attack window: the auth outcome the server chose
+                // stands, so silently drop the stale response rather than throwing (which would tear
+                // down an otherwise valid, authenticated session). Nothing is serialized.
+                break
             default:
                 throw NIOSSHError.protocolViolation(
                     protocolName: "connection",

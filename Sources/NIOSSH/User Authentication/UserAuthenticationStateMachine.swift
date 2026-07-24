@@ -217,8 +217,15 @@ extension UserAuthenticationStateMachine {
     mutating func receiveUserAuthSuccess() throws {
         switch (self.delegate, self.state) {
         case (.client, .awaitingResponses):
-            // Great, we got a response, and it's a success! Disregard all future responses
+            // Great, we got a response, and it's a success! Disregard all future responses.
+            // A keyboard-interactive attempt (if any) is over: clear every bit of its loop state so
+            // that a delegate answering future which resolves *after* this terminal SUCCESS becomes a
+            // safe no-op instead of a trap. In particular, clearing the "response outstanding" flag is
+            // what turns a late `sendUserAuthInfoResponse` into a graceful drop (see that method). A
+            // malicious server can pipeline INFO_REQUEST then SUCCESS to exploit exactly this window.
             self.clientKeyboardInteractiveInProgress = false
+            self.keyboardInteractiveRounds = 0
+            self.clientKeyboardInteractiveResponseOutstanding = false
             self.state = .authenticationSucceeded
         case (.client, .authenticationSucceeded):
             // We should ignore all further auth messages in this state.
@@ -251,9 +258,14 @@ extension UserAuthenticationStateMachine {
         case (.client(let delegate), .awaitingResponses(let responseCount)):
             // Ok, the server didn't like that much. Let's try another one.
             // A keyboard-interactive attempt (if any) is over; clear its loop state so the id-60
-            // decode gate closes and the next attempt starts fresh.
+            // decode gate closes and the next attempt starts fresh. Crucially, clear the
+            // "response outstanding" flag as well: the server may have pipelined INFO_REQUEST then
+            // FAILURE, parking our answering delegate. When that delegate resolves later, the
+            // resulting `sendUserAuthInfoResponse` must find no outstanding challenge and drop the
+            // late response gracefully rather than trapping.
             self.clientKeyboardInteractiveInProgress = false
             self.keyboardInteractiveRounds = 0
+            self.clientKeyboardInteractiveResponseOutstanding = false
             self.state = .awaitingNextRequest
             precondition(responseCount == 1, "We don't support parallel authentication attempts yet!")
             return self.requestNextAuthRequest(methods: .init(message), delegate: delegate)
@@ -521,23 +533,42 @@ extension UserAuthenticationStateMachine {
     }
 
     /// Client side: we are emitting a keyboard-interactive INFO_RESPONSE answering a challenge.
-    mutating func sendUserAuthInfoResponse(_: SSHMessage.UserAuthInfoResponseMessage) {
+    ///
+    /// Returns `true` when the response should actually be serialized and sent, and `false` when it
+    /// must be dropped because the keyboard-interactive exchange it belonged to has already
+    /// terminated. The latter is not a bug in our own code: a malicious server can pipeline an
+    /// INFO_REQUEST immediately followed by a terminal SUCCESS/FAILURE (or a different method), so
+    /// that our asynchronous answering delegate resolves *after* the exchange is already over. When
+    /// that happens the server-decided auth outcome stands and the stale response is simply dropped —
+    /// never a `preconditionFailure`, because that would be a remotely triggerable client crash (DoS).
+    @discardableResult
+    mutating func sendUserAuthInfoResponse(_: SSHMessage.UserAuthInfoResponseMessage) -> Bool {
         switch (self.delegate, self.state) {
         case (.client, .awaitingResponses):
-            precondition(
-                self.clientKeyboardInteractiveInProgress,
-                "Sent an INFO_RESPONSE outside a keyboard-interactive exchange"
-            )
+            guard self.clientKeyboardInteractiveInProgress, self.clientKeyboardInteractiveResponseOutstanding else {
+                // We are back in `.awaitingResponses`, but not for the challenge this response
+                // answers: either the keyboard-interactive attempt was terminated by the server and a
+                // *different* method is now in flight (`inProgress == false`), or its challenge was
+                // already answered / cleared (`responseOutstanding == false`). Drop the stale response.
+                return false
+            }
             // The response is now serialized; a new INFO_REQUEST may follow. Stay in the loop.
             self.clientKeyboardInteractiveResponseOutstanding = false
+            return true
+        case (.client, .awaitingNextRequest),
+            (.client, .authenticationSucceeded),
+            (.client, .authenticationFailed):
+            // The exchange already reached a terminal / next-method transition (the server drained a
+            // SUCCESS/FAILURE ahead of our delegate resolving). Drop the late response gracefully;
+            // never trap on server-controlled message ordering.
+            return false
         case (.client, .idle),
-            (.client, .awaitingServiceAcceptance),
-            (.client, .awaitingNextRequest):
+            (.client, .awaitingServiceAcceptance):
+            // Genuine internal invariant, unreachable via server input: an INFO_RESPONSE is only ever
+            // produced in reply to an INFO_REQUEST, which itself requires having advanced past service
+            // acceptance into `.awaitingResponses`. The state machine can never walk backwards to
+            // these states, so reaching here means a local bug, not a hostile server.
             preconditionFailure("Sent an INFO_RESPONSE without an outstanding challenge")
-        case (.client, .authenticationSucceeded):
-            preconditionFailure("Attempted to send an INFO_RESPONSE after auth succeeded")
-        case (.client, .authenticationFailed):
-            preconditionFailure("Attempted to send an INFO_RESPONSE after auth failed")
         case (.server, _):
             preconditionFailure("Servers never send INFO_RESPONSE")
         }

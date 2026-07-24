@@ -76,7 +76,13 @@ extension SendsUserAuthMessages {
         _ message: SSHMessage.UserAuthInfoResponseMessage,
         into buffer: inout ByteBuffer
     ) throws {
-        self.userAuthStateMachine.sendUserAuthInfoResponse(message)
+        // A `false` return means the keyboard-interactive exchange this response answers has already
+        // terminated (e.g. the server pipelined a terminal SUCCESS/FAILURE ahead of our async
+        // answering delegate resolving). Drop the stale response without serializing anything, so the
+        // caller writes an empty frame — never a client crash from a server-controlled ordering.
+        guard self.userAuthStateMachine.sendUserAuthInfoResponse(message) else {
+            return
+        }
         try self.serializer.serialize(message: .userAuthInfoResponse(message), to: &buffer)
     }
 }

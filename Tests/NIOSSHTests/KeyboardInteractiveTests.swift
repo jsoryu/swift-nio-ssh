@@ -62,6 +62,50 @@ final class ScriptedKIClientDelegate: NIOSSHClientUserAuthenticationDelegate {
     }
 }
 
+/// A client delegate that offers keyboard-interactive once but does **not** answer challenges
+/// synchronously: it parks each answering promise so a test can resolve it *late* — modelling a real
+/// user who is still typing their OTP while a malicious server pipelines a terminal message. Resolving
+/// the parked promise is what reproduces the late-INFO_RESPONSE DoS window.
+final class DeferredKIClientDelegate: NIOSSHClientUserAuthenticationDelegate {
+    private var offered = false
+    private let username: String
+    private let answers: [String]
+    private var pending: [EventLoopPromise<[String]>] = []
+
+    init(username: String = "foo", answers: [String]) {
+        self.username = username
+        self.answers = answers
+    }
+
+    func nextAuthenticationType(
+        availableMethods: NIOSSHAvailableUserAuthenticationMethods,
+        nextChallengePromise: EventLoopPromise<NIOSSHUserAuthenticationOffer?>
+    ) {
+        guard !self.offered else {
+            nextChallengePromise.succeed(nil)
+            return
+        }
+        self.offered = true
+        nextChallengePromise.succeed(
+            .init(username: self.username, serviceName: "ssh-connection", offer: .keyboardInteractive(.init()))
+        )
+    }
+
+    func respondToKeyboardInteractiveChallenge(
+        _ challenge: NIOSSHKeyboardInteractiveChallenge,
+        responsePromise: EventLoopPromise<[String]>
+    ) {
+        // Deliberately do not resolve now — the test resolves this promise later, after a terminal
+        // SUCCESS/FAILURE has already been processed.
+        self.pending.append(responsePromise)
+    }
+
+    /// Resolve the oldest parked challenge, as if the user just finished typing.
+    func resolveOldestPending() {
+        self.pending.removeFirst().succeed(self.answers)
+    }
+}
+
 /// A server delegate that drives a keyboard-interactive exchange by invoking a supplied closure for
 /// each step.
 final class ScriptedKIServerDelegate: NIOSSHServerUserAuthenticationDelegate,
@@ -384,6 +428,109 @@ final class KeyboardInteractiveTests: XCTestCase {
         XCTAssertThrowsError(try stateMachine.receiveUserAuthInfoRequest(infoRequest)) { error in
             XCTAssertEqual((error as? NIOSSHError)?.type, .keyboardInteractiveLimitsExceeded)
         }
+    }
+
+    // MARK: (7) Late-INFO_RESPONSE DoS — a terminal message drains before we answer
+
+    /// Attack (a): server pipelines INFO_REQUEST then USERAUTH_FAILURE. The client's answering delegate
+    /// resolves *late* (the user finishes typing after the failure has already been processed). The
+    /// resulting INFO_RESPONSE must be dropped gracefully — never a `preconditionFailure` — and auth
+    /// must have failed cleanly, proceeding toward the next method / `.authenticationFailed`.
+    func testLateInfoResponseAfterFailureIsDroppedNotTrap() throws {
+        let delegate = DeferredKIClientDelegate(answers: ["123456"])
+        var stateMachine = self.makeClientInKeyboardInteractive(delegate: delegate)
+
+        let infoRequest = SSHMessage.UserAuthInfoRequestMessage(
+            name: "n",
+            instruction: "i",
+            languageTag: "",
+            prompts: [.init(prompt: "One-time Code: ", echo: false)]
+        )
+
+        // INFO_REQUEST parks our answering delegate (response now outstanding)...
+        let answeringFuture = try XCTUnwrap(try stateMachine.receiveUserAuthInfoRequest(infoRequest))
+
+        // ...and a terminal FAILURE is drained from the same read before we could answer. This must
+        // not throw, and it clears the keyboard-interactive loop state.
+        let failureFuture = try XCTUnwrap(
+            try stateMachine.receiveUserAuthFailure(.init(authentications: [], partialSuccess: false))
+        )
+        // No further methods remain, so the client gives up cleanly.
+        XCTAssertNil(try self.resolve(failureFuture))
+        stateMachine.noFurtherMethods()
+
+        // NOW the user finishes typing: the answering delegate resolves late.
+        delegate.resolveOldestPending()
+        let lateResponse = try self.resolve(answeringFuture)
+
+        // The stale INFO_RESPONSE is a graceful no-op (dropped), not a trap.
+        XCTAssertFalse(stateMachine.sendUserAuthInfoResponse(lateResponse))
+
+        // The server-decided failure stands: a subsequent SUCCESS would now be unsolicited.
+        XCTAssertThrowsError(try stateMachine.receiveUserAuthSuccess()) { error in
+            XCTAssertEqual((error as? NIOSSHError)?.type, .protocolViolation)
+        }
+    }
+
+    /// Attack (b): server pipelines INFO_REQUEST then USERAUTH_SUCCESS. The client's answering delegate
+    /// resolves *late*. The stale INFO_RESPONSE must be dropped gracefully and the authenticated state
+    /// must stand — no `preconditionFailure`, no session teardown.
+    func testLateInfoResponseAfterSuccessIsDroppedNotTrap() throws {
+        let delegate = DeferredKIClientDelegate(answers: ["123456"])
+        var stateMachine = self.makeClientInKeyboardInteractive(delegate: delegate)
+
+        let infoRequest = SSHMessage.UserAuthInfoRequestMessage(
+            name: "n",
+            instruction: "i",
+            languageTag: "",
+            prompts: [.init(prompt: "One-time Code: ", echo: false)]
+        )
+
+        let answeringFuture = try XCTUnwrap(try stateMachine.receiveUserAuthInfoRequest(infoRequest))
+
+        // Terminal SUCCESS drained before we answer — must not throw.
+        XCTAssertNoThrow(try stateMachine.receiveUserAuthSuccess())
+
+        // Late resolution of the parked challenge.
+        delegate.resolveOldestPending()
+        let lateResponse = try self.resolve(answeringFuture)
+
+        // Dropped gracefully; authenticated state stands.
+        XCTAssertFalse(stateMachine.sendUserAuthInfoResponse(lateResponse))
+
+        // Still authenticated: a repeated SUCCESS is ignored, and trailing INFO_REQUESTs are ignored.
+        XCTAssertNoThrow(try stateMachine.receiveUserAuthSuccess())
+        XCTAssertNil(try stateMachine.receiveUserAuthInfoRequest(infoRequest))
+    }
+
+    /// Regression guard (c): the fix must not disturb the normal multi-round flow. Each timely
+    /// INFO_RESPONSE is actually sent (`sendUserAuthInfoResponse` returns `true`), the loop continues,
+    /// and a terminal SUCCESS is accepted.
+    func testNormalMultiRoundThenSuccessStillSends() throws {
+        let delegate = ScriptedKIClientDelegate { challenge in
+            Array(repeating: "x", count: challenge.prompts.count)
+        }
+        var stateMachine = self.makeClientInKeyboardInteractive(delegate: delegate)
+
+        let prompt = SSHMessage.UserAuthInfoRequestMessage(
+            name: "n",
+            instruction: "i",
+            languageTag: "",
+            prompts: [.init(prompt: "Password: ", echo: false)]
+        )
+
+        // Round 1: timely answer is actually sent.
+        let f1 = try XCTUnwrap(try stateMachine.receiveUserAuthInfoRequest(prompt))
+        let r1 = try self.resolve(f1)
+        XCTAssertTrue(stateMachine.sendUserAuthInfoResponse(r1))
+
+        // Round 2: still in the loop, still sends.
+        let f2 = try XCTUnwrap(try stateMachine.receiveUserAuthInfoRequest(prompt))
+        let r2 = try self.resolve(f2)
+        XCTAssertTrue(stateMachine.sendUserAuthInfoResponse(r2))
+
+        // Terminal SUCCESS accepted.
+        XCTAssertNoThrow(try stateMachine.receiveUserAuthSuccess())
     }
 
     // MARK: (3) Full client<->server multi-round handshake via the in-process emitter

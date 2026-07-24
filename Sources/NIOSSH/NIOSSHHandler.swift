@@ -214,6 +214,15 @@ extension NIOSSHHandler: ChannelDuplexHandler {
             self.pendingWrite = true
         }
 
+        // A message may legitimately serialize to nothing — e.g. a keyboard-interactive INFO_RESPONSE
+        // that was dropped because its exchange had already terminated (see
+        // `writeUserAuthInfoResponse` / the `.active` `userAuthInfoResponse` drop). In that case there
+        // is nothing to put on the wire; avoid emitting an empty frame, but still honour any promise.
+        guard self.outboundFrameBuffer.readableBytes > 0 else {
+            promise?.succeed(())
+            return
+        }
+
         context.write(self.wrapOutboundOut(self.outboundFrameBuffer), promise: promise)
     }
 
