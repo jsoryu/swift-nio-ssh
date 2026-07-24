@@ -700,16 +700,24 @@ extension ByteBuffer {
                     // Consistency check between the algorithm name and the key. For most
                     // key types the algorithm name equals the key-blob prefix. RSA is the
                     // RFC 8332 exception: the key prefix stays "ssh-rsa" while the algorithm
-                    // name is "rsa-sha2-256"/"rsa-sha2-512". Accept that decoupling for RSA
-                    // keys (an "ssh-rsa"/SHA-1 name maps to nil above and is already rejected
-                    // by the knownAlgorithms gate, so it never reaches here).
+                    // name is "rsa-sha2-256"/"rsa-sha2-512". The RSA arm below is gated
+                    // explicitly on a valid rsa-sha2 name, so an "ssh-rsa"/SHA-1 name is
+                    // rejected here regardless of the earlier knownAlgorithms filter.
                     let algorithmNameView = algorithmName.readableBytesView
                     let rsaSignatureAlgorithm = RSASignatureAlgorithm(algorithmName: algorithmNameView)
                     let algorithmMatchesKey: Bool
-                    if algorithmNameView.elementsEqual(publicKey.keyPrefix) {
-                        algorithmMatchesKey = true
-                    } else if publicKey.keyPrefix.elementsEqual(NIOSSHPublicKey.rsaPublicKeyPrefix) {
+                    if publicKey.keyPrefix.elementsEqual(NIOSSHPublicKey.rsaPublicKeyPrefix) {
+                        // RSA (RFC 8332): the key-blob prefix is "ssh-rsa" but the user-auth
+                        // algorithm name MUST be an rsa-sha2 name. Gate the RSA arm explicitly
+                        // on `RSASignatureAlgorithm(algorithmName:)` being non-nil, so the
+                        // legacy "ssh-rsa"/SHA-1 name is rejected here directly rather than by
+                        // ordering — the invariant survives future edits to the knownAlgorithms
+                        // gate. Checking the RSA key prefix first also prevents the general
+                        // name-equals-prefix branch from ever accepting an "ssh-rsa" name.
                         algorithmMatchesKey = rsaSignatureAlgorithm != nil
+                    } else if algorithmNameView.elementsEqual(publicKey.keyPrefix) {
+                        // Every non-RSA key type uses an algorithm name equal to its key prefix.
+                        algorithmMatchesKey = true
                     } else {
                         algorithmMatchesKey = false
                     }

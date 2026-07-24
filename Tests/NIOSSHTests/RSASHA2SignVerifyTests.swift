@@ -166,4 +166,40 @@ final class RSASHA2SignVerifyTests: XCTestCase {
             XCTAssertEqual((error as? NIOSSHError).map { $0.type }, .unknownSignature)
         }
     }
+
+    // MARK: - minimum RSA modulus floor on the host-key read path
+
+    /// Defense-in-depth: a well-formed "ssh-rsa" wire blob whose modulus is below the
+    /// 2048-bit floor (here 1024 bits) must be rejected by the host-key reader, while a
+    /// normal 2048-bit key still round-trips. This keeps the min-modulus guard in
+    /// `readRSAPublicKey` live.
+    func testRSAPublicKeyBelowMinimumModulusIsRejectedOnRead() throws {
+        // Build a genuine 1024-bit "ssh-rsa" blob with the fork's own writer, which
+        // applies no size floor, so only the reader's guard can reject it.
+        let weakKey = try _RSA.Signing.PrivateKey(unsafeKeySize: _RSA.Signing.KeySize(bitCount: 1024))
+        let weakPublicKey = NIOSSHPrivateKey(rsaKey: weakKey).publicKey
+        XCTAssertTrue(
+            weakPublicKey.keyPrefix.elementsEqual("ssh-rsa".utf8),
+            "the weak key must serialize under the ssh-rsa key prefix"
+        )
+
+        var weakBuffer = ByteBufferAllocator().buffer(capacity: 1024)
+        weakBuffer.writeSSHHostKey(weakPublicKey)
+        XCTAssertNil(
+            try weakBuffer.readSSHHostKey(),
+            "a 1024-bit RSA host key is below the 2048-bit floor and must be rejected on read"
+        )
+
+        // A normal 2048-bit key must still be accepted.
+        let strongKey = try _RSA.Signing.PrivateKey(keySize: .bits2048)
+        let strongPublicKey = NIOSSHPrivateKey(rsaKey: strongKey).publicKey
+
+        var strongBuffer = ByteBufferAllocator().buffer(capacity: 1024)
+        strongBuffer.writeSSHHostKey(strongPublicKey)
+        XCTAssertEqual(
+            try strongBuffer.readSSHHostKey(),
+            strongPublicKey,
+            "a 2048-bit RSA host key must still be accepted on read"
+        )
+    }
 }

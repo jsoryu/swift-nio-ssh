@@ -551,6 +551,7 @@ extension ByteBuffer {
     /// The bytes are untrusted: `readSSHString` bounds-checks each field, and
     /// `_RSA.Signing.PublicKey(n:e:)` throws (never traps) on an invalid modulus or
     /// exponent. `mpIntView` strips the sign-padding leading zero of each mpint.
+    /// Keys whose modulus is below the 2048-bit floor are rejected (returns `nil`).
     ///
     /// Not safe to call from arbitrary code as this does not return the reader index on failure: it relies on the caller performing
     /// the rewind.
@@ -567,6 +568,14 @@ extension ByteBuffer {
             n: Data(nBytes.mpIntView),
             e: Data(eBytes.mpIntView)
         )
+
+        // Defense-in-depth: reject RSA moduli below 2048 bits. The wire
+        // `_RSA.Signing.PublicKey(n:e:)` init performs no minimum-size check, unlike
+        // swift-crypto's DER/PEM inits, which enforce this same 2048-bit floor. `e` is
+        // left to BoringSSL to validate.
+        guard key.keySizeInBits >= 2048 else {
+            return nil
+        }
         return NIOSSHPublicKey(backingKey: .rsa(key))
     }
 
