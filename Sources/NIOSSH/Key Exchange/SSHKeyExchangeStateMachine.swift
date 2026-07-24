@@ -289,7 +289,12 @@ struct SSHKeyExchangeStateMachine {
         case .keyExchangeInitSent(exchange: var exchanger, let negotiated):
             switch self.role {
             case .client:
-                guard message.hostKey.keyPrefix.elementsEqual(negotiated.negotiatedHostKeyAlgorithm.utf8) else {
+                // The host-key blob prefix and the negotiated host-key algorithm name
+                // coincide for every key type except RSA, where RFC 8332 decouples them:
+                // the blob stays `ssh-rsa` while the negotiated algorithm is
+                // `rsa-sha2-512`/`rsa-sha2-256`. Validate that the received host key is
+                // consistent with the algorithm we actually negotiated.
+                guard message.hostKey.hostKeyAlgorithms.contains(negotiated.negotiatedHostKeyAlgorithm) else {
                     throw NIOSSHError.invalidHostKeyForKeyExchange(
                         expected: negotiated.negotiatedHostKeyAlgorithm,
                         got: message.hostKey.keyPrefix
@@ -600,9 +605,15 @@ extension SSHKeyExchangeStateMachine {
         $0.keyExchangeAlgorithmNames
     }
 
-    /// All known host key algorithms.
+    /// All known host key algorithms, in descending order of preference.
+    ///
+    /// RSA (RFC 8332 `rsa-sha2-512`/`rsa-sha2-256`) is advertised at the lowest
+    /// preference: ed25519 and ECDSA are preferred over RSA, and `rsa-sha2-512`
+    /// is preferred over `rsa-sha2-256`. `ssh-rsa` (SHA-1) is deliberately absent
+    /// and is never advertised or accepted for host-key verification.
     static let supportedServerHostKeyAlgorithms: [Substring] = [
         "ssh-ed25519", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp521",
+        "rsa-sha2-512", "rsa-sha2-256",
     ]
 }
 

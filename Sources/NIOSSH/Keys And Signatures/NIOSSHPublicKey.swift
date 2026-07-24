@@ -223,6 +223,23 @@ extension NIOSSHPublicKey {
         }
     }
 
+    /// The host-key algorithm names that a peer may negotiate for this key, in
+    /// descending order of preference.
+    ///
+    /// For every key type except RSA this is a single name equal to ``keyPrefix``.
+    /// RSA is the sole case where the negotiated host-key algorithm name decouples
+    /// from the `ssh-rsa` key-blob prefix (RFC 8332): the blob stays `ssh-rsa`, but
+    /// the negotiated algorithm is `rsa-sha2-512` or `rsa-sha2-256`. `ssh-rsa`
+    /// (SHA-1) is deliberately absent and is never accepted.
+    internal var hostKeyAlgorithms: [Substring] {
+        switch self.backingKey {
+        case .rsa:
+            return ["rsa-sha2-512", "rsa-sha2-256"]
+        case .ed25519, .ecdsaP256, .ecdsaP384, .ecdsaP521, .certified:
+            return [Substring(String(decoding: self.keyPrefix, as: Unicode.UTF8.self))]
+        }
+    }
+
     /// The algorithm name to use for a user-auth signature over this key.
     ///
     /// For every key type except RSA this equals ``keyPrefix``. RSA is the sole case

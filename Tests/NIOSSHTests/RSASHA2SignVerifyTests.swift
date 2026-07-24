@@ -202,4 +202,95 @@ final class RSASHA2SignVerifyTests: XCTestCase {
             "a 2048-bit RSA host key must still be accepted on read"
         )
     }
+
+    // MARK: - advertised host-key algorithm list
+
+    /// The client advertises rsa-sha2-512 and rsa-sha2-256 for host-key verification,
+    /// at the lowest preference (ed25519/ECDSA ahead of RSA, 512 ahead of 256), and never
+    /// advertises ssh-rsa (SHA-1).
+    func testAdvertisedHostKeyAlgorithmsContainRSASHA2ButNotSHA1() {
+        let algorithms = SSHKeyExchangeStateMachine.supportedServerHostKeyAlgorithms
+
+        XCTAssertTrue(algorithms.contains("rsa-sha2-512"), "rsa-sha2-512 must be advertised")
+        XCTAssertTrue(algorithms.contains("rsa-sha2-256"), "rsa-sha2-256 must be advertised")
+
+        // ssh-rsa (SHA-1) must never appear.
+        XCTAssertFalse(algorithms.contains("ssh-rsa"), "ssh-rsa (SHA-1) must never be advertised")
+
+        // RSA is lowest preference: every non-RSA algorithm precedes both rsa-sha2 names.
+        guard
+            let idx512 = algorithms.firstIndex(of: "rsa-sha2-512"),
+            let idx256 = algorithms.firstIndex(of: "rsa-sha2-256")
+        else {
+            XCTFail("rsa-sha2-512/256 must both be present")
+            return
+        }
+        XCTAssertLessThan(idx512, idx256, "rsa-sha2-512 must be preferred over rsa-sha2-256")
+
+        let nonRSA = ["ssh-ed25519", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp521"]
+        for name in nonRSA {
+            guard let idx = algorithms.firstIndex(of: Substring(name)) else {
+                XCTFail("expected \(name) to be advertised")
+                continue
+            }
+            XCTAssertLessThan(idx, idx512, "\(name) must be preferred over RSA")
+        }
+    }
+
+    // MARK: - RSA signature over the exchange hash (host-key verify path)
+
+    /// Mirrors the KEX host-key verification: the server signs the exchange-hash digest with
+    /// `sign(digest:)`, and the client verifies it with the digest-based `isValidSignature`.
+    /// A genuine signature must verify true; a tampered exchange hash and an unrelated key must
+    /// both verify false. `digestWidth` picks the exchange-hash width (SHA-512 → rsa-sha2-512,
+    /// SHA-256 → rsa-sha2-256), matching the algorithm tag the signer emits.
+    private func assertExchangeHashSignVerify<D: Digest>(
+        exchangeHash: D,
+        tamperedHash: D,
+        expectedBacking: (NIOSSHSignature.BackingSignature) -> Bool
+    ) throws {
+        let rsaKey = try _RSA.Signing.PrivateKey(keySize: .bits2048)
+        let hostKey = NIOSSHPrivateKey(rsaKey: rsaKey)
+
+        let signature = try hostKey.sign(digest: exchangeHash)
+        XCTAssertTrue(
+            expectedBacking(signature.backingSignature),
+            "signature algorithm tag must match the exchange-hash width"
+        )
+
+        // Genuine signature over the genuine exchange hash verifies true.
+        XCTAssertTrue(
+            hostKey.publicKey.isValidSignature(signature, for: exchangeHash),
+            "a genuine RSA host-key signature over the exchange hash must verify"
+        )
+
+        // A tampered exchange hash must NOT verify under the same signature.
+        XCTAssertFalse(
+            hostKey.publicKey.isValidSignature(signature, for: tamperedHash),
+            "a tampered exchange hash must not verify"
+        )
+
+        // An unrelated host key must NOT verify the signature.
+        let otherKey = NIOSSHPrivateKey(rsaKey: try _RSA.Signing.PrivateKey(keySize: .bits2048))
+        XCTAssertFalse(
+            otherKey.publicKey.isValidSignature(signature, for: exchangeHash),
+            "an unrelated RSA host key must not verify the signature"
+        )
+    }
+
+    func testRSAHostKeyVerifiesExchangeHashSHA512() throws {
+        try self.assertExchangeHashSignVerify(
+            exchangeHash: SHA512.hash(data: Array("genuine-exchange-hash".utf8)),
+            tamperedHash: SHA512.hash(data: Array("tampered-exchange-hash".utf8)),
+            expectedBacking: { if case .rsaSHA512 = $0 { return true } else { return false } }
+        )
+    }
+
+    func testRSAHostKeyVerifiesExchangeHashSHA256() throws {
+        try self.assertExchangeHashSignVerify(
+            exchangeHash: SHA256.hash(data: Array("genuine-exchange-hash".utf8)),
+            tamperedHash: SHA256.hash(data: Array("tampered-exchange-hash".utf8)),
+            expectedBacking: { if case .rsaSHA256 = $0 { return true } else { return false } }
+        )
+    }
 }

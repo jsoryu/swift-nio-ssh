@@ -16,6 +16,7 @@ import Crypto
 import NIOCore
 import NIOEmbedded
 import XCTest
+import _CryptoExtras
 
 @testable import NIOSSH
 
@@ -566,6 +567,17 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
 
     func testKeyExchangeUsingP521HostKeysOnly() throws {
         try self.straightforwardCustomHostKeyHandshake(hostKey: .init(p521Key: .init()))
+    }
+
+    func testKeyExchangeUsingRSAHostKeyOnly() throws {
+        // End-to-end proof that a client negotiates an RSA (rsa-sha2) host-key algorithm,
+        // reads the server's ssh-rsa host key, and verifies the server's signature over the
+        // exchange hash. If verification failed, `client.handle(keyExchangeReply:)` would
+        // throw `NIOSSHError.invalidExchangeHashSignature` and this handshake would not
+        // complete. The server here advertises only rsa-sha2-512/rsa-sha2-256, so a
+        // successful handshake means the client selected and verified an RSA host key.
+        let rsaKey = try _RSA.Signing.PrivateKey(keySize: .bits2048)
+        try self.straightforwardCustomHostKeyHandshake(hostKey: .init(rsaKey: rsaKey))
     }
 
     private func straightforwardCustomHostKeyHandshake(hostKey: NIOSSHPrivateKey) throws {
