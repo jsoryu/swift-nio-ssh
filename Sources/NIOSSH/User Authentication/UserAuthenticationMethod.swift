@@ -33,7 +33,15 @@ public struct NIOSSHAvailableUserAuthenticationMethods: OptionSet, Sendable {
     /// Host-based authentication is acceptable.
     public static let hostBased: NIOSSHAvailableUserAuthenticationMethods = .init(rawValue: 1 << 2)
 
+    /// Keyboard-interactive (RFC 4256) authentication is acceptable.
+    public static let keyboardInteractive: NIOSSHAvailableUserAuthenticationMethods = .init(rawValue: 1 << 3)
+
     /// A short-hand for all supported authentication types.
+    ///
+    /// - Note: `.keyboardInteractive` is deliberately excluded. The client offers it only when the
+    ///     server explicitly advertises it (via a `USERAUTH_FAILURE` re-offer), mirroring upstream
+    ///     PR #242, so that a server that does not support it is never sent a keyboard-interactive
+    ///     request speculatively.
     public static let all: NIOSSHAvailableUserAuthenticationMethods = [.publicKey, .password, .hostBased]
 }
 
@@ -49,6 +57,8 @@ extension NIOSSHAvailableUserAuthenticationMethods {
                 self.insert(.password)
             case "hostbased":
                 self.insert(.hostBased)
+            case "keyboard-interactive":
+                self.insert(.keyboardInteractive)
             default:
                 // This is an unknown method, which we ignore.
                 break
@@ -63,7 +73,7 @@ extension NIOSSHAvailableUserAuthenticationMethods {
 
         // We need an array.
         var methods = [Substring]()
-        methods.reserveCapacity(3)
+        methods.reserveCapacity(4)
 
         if self.contains(.password) {
             methods.append("password")
@@ -73,6 +83,9 @@ extension NIOSSHAvailableUserAuthenticationMethods {
         }
         if self.contains(.hostBased) {
             methods.append("hostbased")
+        }
+        if self.contains(.keyboardInteractive) {
+            methods.append("keyboard-interactive")
         }
 
         return methods
@@ -185,6 +198,12 @@ extension NIOSSHUserAuthenticationOffer {
         /// This method is currently unsupported by ``NIOSSH``.
         case hostBased(HostBased)
 
+        /// The client would like to perform keyboard-interactive (RFC 4256) authentication.
+        ///
+        /// The actual challenge responses are supplied later, via the client delegate's
+        /// ``NIOSSHClientUserAuthenticationDelegate/respondToKeyboardInteractiveChallenge(_:responsePromise:)``.
+        case keyboardInteractive(KeyboardInteractive)
+
         /// The client believes it does not need authentication.
         case none
     }
@@ -242,6 +261,23 @@ extension NIOSSHUserAuthenticationOffer.Offer {
             fatalError("PublicKeyRequest is currently unimplemented")
         }
     }
+
+    /// Information provided by the client when offering keyboard-interactive (RFC 4256) authentication.
+    ///
+    /// This is a pure data carrier for the initial `USERAUTH_REQUEST`; the interactive challenge
+    /// responses are delivered separately by the client delegate.
+    public struct KeyboardInteractive: Sendable {
+        /// The RFC 3066 language tag hint sent to the server. Commonly empty.
+        public var languageTag: String
+
+        /// A comma-separated hint of preferred submethods (RFC 4256 § 3.1). Commonly empty.
+        public var submethods: String
+
+        public init(languageTag: String = "", submethods: String = "") {
+            self.languageTag = languageTag
+            self.submethods = submethods
+        }
+    }
 }
 
 extension SSHMessage.UserAuthRequestMessage {
@@ -266,6 +302,13 @@ extension SSHMessage.UserAuthRequestMessage {
             )
         case .password(let passwordRequest):
             self.method = .password(passwordRequest.password)
+        case .keyboardInteractive(let keyboardInteractive):
+            // RFC 4256: the initial request is unsigned (unlike publickey). The interactive
+            // challenge/response loop happens afterwards, driven by the client delegate.
+            self.method = .keyboardInteractive(
+                languageTag: keyboardInteractive.languageTag,
+                submethods: keyboardInteractive.submethods
+            )
         case .hostBased:
             fatalError("Unsupported")
         case .none:
@@ -292,6 +335,8 @@ enum NIOSSHUserAuthenticationResponseMessage {
     case success
     case failure(SSHMessage.UserAuthFailureMessage)
     case publicKeyOK(SSHMessage.UserAuthPKOKMessage)
+    // Server-side keyboard-interactive: issue an INFO_REQUEST challenge to the client.
+    case infoRequest(SSHMessage.UserAuthInfoRequestMessage)
 }
 
 extension NIOSSHUserAuthenticationResponseMessage {

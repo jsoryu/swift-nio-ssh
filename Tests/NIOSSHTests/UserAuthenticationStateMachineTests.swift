@@ -255,6 +255,8 @@ final class UserAuthenticationStateMachineTests: XCTestCase {
                 message.value = response
             case .success(.publicKeyOK):
                 XCTFail("Unexpected public key ok")
+            case .success(.infoRequest):
+                XCTFail("Unexpected info request")
             case .success(.success):
                 XCTFail("Unexpected success")
             case .failure(let error):
@@ -283,6 +285,8 @@ final class UserAuthenticationStateMachineTests: XCTestCase {
                 completed.value = true
             case .success(.publicKeyOK):
                 XCTFail("Unexpected public key ok")
+            case .success(.infoRequest):
+                XCTFail("Unexpected info request")
             case .success(.failure):
                 XCTFail("Unexpected failure")
             case .failure(let error):
@@ -310,6 +314,8 @@ final class UserAuthenticationStateMachineTests: XCTestCase {
             switch $0 {
             case .success(.publicKeyOK(let response)):
                 message.value = response
+            case .success(.infoRequest):
+                XCTFail("Unexpected info request")
             case .success(.success):
                 XCTFail("Unexpected success")
             case .success(.failure):

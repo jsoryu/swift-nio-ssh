@@ -20,12 +20,45 @@ struct UserAuthenticationStateMachine {
     private let loop: EventLoop
     private var sessionID: ByteBuffer
 
+    /// Client side: `true` while a keyboard-interactive attempt is live (from sending the
+    /// keyboard-interactive `USERAUTH_REQUEST` until the terminal SUCCESS/FAILURE). This is the
+    /// source of truth for the id-60 decode gate.
+    private var clientKeyboardInteractiveInProgress: Bool = false
+
+    /// Client side: the number of INFO_REQUEST rounds seen in the current keyboard-interactive
+    /// attempt, capped to defend against a malicious server driving an unbounded loop.
+    private var keyboardInteractiveRounds: Int = 0
+
+    /// Client side: `true` while an INFO_RESPONSE for a received INFO_REQUEST is still outstanding
+    /// (delegate promise not yet resolved and serialized). Enforces a single in-flight response so a
+    /// server cannot pipeline INFO_REQUESTs and race our replies.
+    private var clientKeyboardInteractiveResponseOutstanding: Bool = false
+
+    /// Server side: when non-`nil`, the server has issued an INFO_REQUEST with this many prompts and
+    /// is awaiting the client's INFO_RESPONSE. Used to enforce num-responses == num-prompts and to
+    /// distinguish a legitimate INFO_RESPONSE from a stray one.
+    private var serverKeyboardInteractivePendingPromptCount: Int?
+
+    /// Server side: the username of the in-flight keyboard-interactive exchange, captured from the
+    /// initial `USERAUTH_REQUEST` so it can be supplied to the delegate on each subsequent round.
+    private var serverKeyboardInteractiveUsername: String?
+
     // TODO: The server SHOULD limit the number of authentication attempts the client may make.
     init(role: SSHConnectionRole, loop: EventLoop, sessionID: ByteBuffer) {
         self.state = .idle
         self.delegate = UserAuthDelegate(role: role)
         self.loop = loop
         self.sessionID = sessionID
+    }
+
+    /// Whether this side currently expects to decode an incoming message id 60 as an RFC 4256
+    /// `USERAUTH_INFO_REQUEST` (rather than `USERAUTH_PK_OK`). Only a client mid keyboard-interactive
+    /// attempt ever does. This drives ``SSHPacketParser/keyboardInteractiveInProgress``.
+    var isExpectingKeyboardInteractiveInfoRequest: Bool {
+        if case .client = self.delegate {
+            return self.clientKeyboardInteractiveInProgress
+        }
+        return false
     }
 
     fileprivate static let serviceName: String = "ssh-userauth"
@@ -185,6 +218,7 @@ extension UserAuthenticationStateMachine {
         switch (self.delegate, self.state) {
         case (.client, .awaitingResponses):
             // Great, we got a response, and it's a success! Disregard all future responses
+            self.clientKeyboardInteractiveInProgress = false
             self.state = .authenticationSucceeded
         case (.client, .authenticationSucceeded):
             // We should ignore all further auth messages in this state.
@@ -216,6 +250,10 @@ extension UserAuthenticationStateMachine {
         switch (self.delegate, self.state) {
         case (.client(let delegate), .awaitingResponses(let responseCount)):
             // Ok, the server didn't like that much. Let's try another one.
+            // A keyboard-interactive attempt (if any) is over; clear its loop state so the id-60
+            // decode gate closes and the next attempt starts fresh.
+            self.clientKeyboardInteractiveInProgress = false
+            self.keyboardInteractiveRounds = 0
             self.state = .awaitingNextRequest
             precondition(responseCount == 1, "We don't support parallel authentication attempts yet!")
             return self.requestNextAuthRequest(methods: .init(message), delegate: delegate)
@@ -262,6 +300,113 @@ extension UserAuthenticationStateMachine {
             return
         }
     }
+
+    /// Client side: a keyboard-interactive INFO_REQUEST (RFC 4256 § 3.2) was received.
+    ///
+    /// Valid only while a keyboard-interactive attempt is live. Invokes the client delegate's
+    /// answering promise, enforces num-responses == num-prompts, and remains in `.awaitingResponses`
+    /// so the challenge→response loop continues within the same authentication attempt (no attempt
+    /// budget is consumed per round).
+    mutating func receiveUserAuthInfoRequest(
+        _ message: SSHMessage.UserAuthInfoRequestMessage
+    ) throws -> EventLoopFuture<SSHMessage.UserAuthInfoResponseMessage>? {
+        switch (self.delegate, self.state) {
+        case (.client(let delegate), .awaitingResponses):
+            guard self.clientKeyboardInteractiveInProgress else {
+                throw NIOSSHError.protocolViolation(
+                    protocolName: Self.protocolName,
+                    violation: "received INFO_REQUEST outside a keyboard-interactive exchange"
+                )
+            }
+            guard !self.clientKeyboardInteractiveResponseOutstanding else {
+                throw NIOSSHError.protocolViolation(
+                    protocolName: Self.protocolName,
+                    violation: "received INFO_REQUEST while a prior INFO_RESPONSE is still outstanding"
+                )
+            }
+
+            self.keyboardInteractiveRounds += 1
+            guard self.keyboardInteractiveRounds <= KeyboardInteractiveLimits.maximumRounds else {
+                throw NIOSSHError.keyboardInteractiveLimitsExceeded(
+                    reason: "keyboard-interactive exchange exceeded \(KeyboardInteractiveLimits.maximumRounds) rounds"
+                )
+            }
+
+            self.clientKeyboardInteractiveResponseOutstanding = true
+            return self.answerKeyboardInteractiveChallenge(message, delegate: delegate)
+
+        case (.client, .authenticationSucceeded):
+            // Auth already succeeded; ignore trailing messages.
+            return nil
+
+        case (.client, _):
+            throw NIOSSHError.protocolViolation(
+                protocolName: Self.protocolName,
+                violation: "received INFO_REQUEST at an unexpected time"
+            )
+
+        case (.server, _):
+            // Servers never decode id 60 as INFO_REQUEST (the gate is client-only), so this is a
+            // protocol violation if it ever arrives.
+            throw NIOSSHError.protocolViolation(
+                protocolName: Self.protocolName,
+                violation: "client received INFO_REQUEST on the server side"
+            )
+        }
+    }
+
+    /// Server side: a keyboard-interactive INFO_RESPONSE (RFC 4256 § 3.4) was received.
+    ///
+    /// Valid only while the server has an outstanding INFO_REQUEST. Enforces
+    /// num-responses == num-prompts, then asks the delegate for the next step (another challenge or a
+    /// terminal outcome).
+    mutating func receiveUserAuthInfoResponse(
+        _ message: SSHMessage.UserAuthInfoResponseMessage
+    ) throws -> EventLoopFuture<NIOSSHUserAuthenticationResponseMessage>? {
+        switch (self.delegate, self.state) {
+        case (.server(let delegate), .awaitingResponses):
+            guard let expectedCount = self.serverKeyboardInteractivePendingPromptCount else {
+                throw NIOSSHError.protocolViolation(
+                    protocolName: Self.protocolName,
+                    violation: "received INFO_RESPONSE without an outstanding INFO_REQUEST"
+                )
+            }
+            guard message.responses.count == expectedCount else {
+                throw NIOSSHError.invalidKeyboardInteractiveResponse(
+                    reason: "expected \(expectedCount) response(s), client provided \(message.responses.count)"
+                )
+            }
+
+            self.serverKeyboardInteractivePendingPromptCount = nil
+
+            guard let kiDelegate = delegate as? NIOSSHServerKeyboardInteractiveAuthenticationDelegate else {
+                throw NIOSSHError.unsupportedUserAuthenticationMethod
+            }
+
+            let username = self.serverKeyboardInteractiveUsername ?? ""
+            return self.serverKeyboardInteractiveStep(
+                username: username,
+                previousResponses: message.responses,
+                delegate: kiDelegate,
+                supportedMethods: delegate.supportedAuthenticationMethods
+            )
+
+        case (.server, .authenticationSucceeded):
+            return nil
+
+        case (.server, _):
+            throw NIOSSHError.protocolViolation(
+                protocolName: Self.protocolName,
+                violation: "received INFO_RESPONSE at an unexpected time"
+            )
+
+        case (.client, _):
+            throw NIOSSHError.protocolViolation(
+                protocolName: Self.protocolName,
+                violation: "server sent INFO_RESPONSE to a client"
+            )
+        }
+    }
 }
 
 // MARK: Sending Messages
@@ -301,9 +446,18 @@ extension UserAuthenticationStateMachine {
         }
     }
 
-    mutating func sendUserAuthRequest(_: SSHMessage.UserAuthRequestMessage) {
+    mutating func sendUserAuthRequest(_ message: SSHMessage.UserAuthRequestMessage) {
         switch (self.delegate, self.state) {
         case (.client, .awaitingNextRequest):
+            // Record whether this is a keyboard-interactive attempt. This both opens the id-60
+            // decode gate (so the next id 60 is an INFO_REQUEST) and starts a fresh round counter.
+            if case .keyboardInteractive = message.method {
+                self.clientKeyboardInteractiveInProgress = true
+                self.keyboardInteractiveRounds = 0
+                self.clientKeyboardInteractiveResponseOutstanding = false
+            } else {
+                self.clientKeyboardInteractiveInProgress = false
+            }
             self.state = .awaitingResponses(1)
         case (.client, .idle),
             (.client, .awaitingServiceAcceptance):
@@ -342,6 +496,50 @@ extension UserAuthenticationStateMachine {
             preconditionFailure("Servers can never enter authenticationFailed")
         case (.client, _):
             preconditionFailure("Clients never send auth responses")
+        }
+    }
+
+    /// Server side: we are emitting a keyboard-interactive INFO_REQUEST challenge.
+    mutating func sendUserAuthInfoRequest(_ message: SSHMessage.UserAuthInfoRequestMessage) {
+        switch (self.delegate, self.state) {
+        case (.server, .awaitingResponses):
+            // Remain awaiting responses; record the prompt count so the matching INFO_RESPONSE can
+            // be validated (num-responses == num-prompts) and distinguished from a stray one.
+            self.serverKeyboardInteractivePendingPromptCount = message.prompts.count
+        case (.server, .idle),
+            (.server, .awaitingServiceAcceptance):
+            preconditionFailure("Server sent an INFO_REQUEST prior to receiving an auth request")
+        case (.server, .awaitingNextRequest):
+            preconditionFailure("Server sent an INFO_REQUEST with no auth request in flight")
+        case (.server, .authenticationSucceeded):
+            preconditionFailure("Authentication already succeeded, further messages are unnecessary.")
+        case (.server, .authenticationFailed):
+            preconditionFailure("Servers can never enter authenticationFailed")
+        case (.client, _):
+            preconditionFailure("Clients never send INFO_REQUEST")
+        }
+    }
+
+    /// Client side: we are emitting a keyboard-interactive INFO_RESPONSE answering a challenge.
+    mutating func sendUserAuthInfoResponse(_: SSHMessage.UserAuthInfoResponseMessage) {
+        switch (self.delegate, self.state) {
+        case (.client, .awaitingResponses):
+            precondition(
+                self.clientKeyboardInteractiveInProgress,
+                "Sent an INFO_RESPONSE outside a keyboard-interactive exchange"
+            )
+            // The response is now serialized; a new INFO_REQUEST may follow. Stay in the loop.
+            self.clientKeyboardInteractiveResponseOutstanding = false
+        case (.client, .idle),
+            (.client, .awaitingServiceAcceptance),
+            (.client, .awaitingNextRequest):
+            preconditionFailure("Sent an INFO_RESPONSE without an outstanding challenge")
+        case (.client, .authenticationSucceeded):
+            preconditionFailure("Attempted to send an INFO_RESPONSE after auth succeeded")
+        case (.client, .authenticationFailed):
+            preconditionFailure("Attempted to send an INFO_RESPONSE after auth failed")
+        case (.server, _):
+            preconditionFailure("Servers never send INFO_RESPONSE")
         }
     }
 
@@ -457,7 +655,7 @@ extension UserAuthenticationStateMachine {
 // MARK: Interacting with server delegate
 
 extension UserAuthenticationStateMachine {
-    fileprivate func nextAuthResponse(
+    fileprivate mutating func nextAuthResponse(
         request: SSHMessage.UserAuthRequestMessage,
         delegate: NIOSSHServerUserAuthenticationDelegate
     ) -> EventLoopFuture<NIOSSHUserAuthenticationResponseMessage> {
@@ -522,6 +720,25 @@ extension UserAuthenticationStateMachine {
                 .failure(.init(authentications: delegate.supportedAuthenticationMethods.strings, partialSuccess: false))
             )
 
+        case .keyboardInteractive:
+            // RFC 4256: begin (or, for a re-offer, restart) a keyboard-interactive exchange. If the
+            // delegate does not support it, fail like any other unsupported method.
+            let supportedMethods = delegate.supportedAuthenticationMethods
+            guard let kiDelegate = delegate as? NIOSSHServerKeyboardInteractiveAuthenticationDelegate else {
+                return self.loop.makeSucceededFuture(
+                    .failure(.init(authentications: supportedMethods.strings, partialSuccess: false))
+                )
+            }
+
+            self.serverKeyboardInteractiveUsername = request.username
+            self.serverKeyboardInteractivePendingPromptCount = nil
+            return self.serverKeyboardInteractiveStep(
+                username: request.username,
+                previousResponses: nil,
+                delegate: kiDelegate,
+                supportedMethods: supportedMethods
+            )
+
         case .none:
             let request = NIOSSHUserAuthenticationRequest(
                 username: request.username,
@@ -535,6 +752,76 @@ extension UserAuthenticationStateMachine {
             return promise.futureResult.map { outcome in
                 .init(outcome, supportedMethods: supportedMethods)
             }
+        }
+    }
+
+    /// Server side: ask the keyboard-interactive delegate for its next step and map it to a wire
+    /// response (an INFO_REQUEST challenge, or a terminal success/failure).
+    fileprivate func serverKeyboardInteractiveStep(
+        username: String,
+        previousResponses: [String]?,
+        delegate: NIOSSHServerKeyboardInteractiveAuthenticationDelegate,
+        supportedMethods: NIOSSHAvailableUserAuthenticationMethods
+    ) -> EventLoopFuture<NIOSSHUserAuthenticationResponseMessage> {
+        let promise = self.loop.makePromise(of: NIOSSHKeyboardInteractiveServerStep.self)
+        delegate.nextKeyboardInteractiveStep(
+            username: username,
+            previousResponses: previousResponses,
+            promise: promise
+        )
+
+        return promise.futureResult.map { step in
+            switch step {
+            case .challenge(let challenge):
+                let prompts = challenge.prompts.map {
+                    SSHMessage.UserAuthInfoRequestMessage.Prompt(prompt: $0.prompt, echo: $0.echo)
+                }
+                return .infoRequest(
+                    .init(
+                        name: challenge.name,
+                        instruction: challenge.instruction,
+                        languageTag: challenge.languageTag,
+                        prompts: prompts
+                    )
+                )
+            case .outcome(let outcome):
+                return .init(outcome, supportedMethods: supportedMethods)
+            }
+        }
+    }
+}
+
+// MARK: Keyboard-interactive (client answering)
+
+extension UserAuthenticationStateMachine {
+    /// Client side: hand the challenge to the delegate and build the INFO_RESPONSE from its answers.
+    ///
+    /// Enforces num-responses == num-prompts (RFC 4256 § 3.4). Note that echo=false answers are
+    /// credentials: they are never logged here, and are held only as long as needed to serialize the
+    /// response. Deeper zeroization of the collected buffers is the responsibility of the application
+    /// layer that gathers the answers.
+    fileprivate func answerKeyboardInteractiveChallenge(
+        _ message: SSHMessage.UserAuthInfoRequestMessage,
+        delegate: NIOSSHClientUserAuthenticationDelegate
+    ) -> EventLoopFuture<SSHMessage.UserAuthInfoResponseMessage> {
+        let challenge = NIOSSHKeyboardInteractiveChallenge(
+            name: message.name,
+            instruction: message.instruction,
+            languageTag: message.languageTag,
+            prompts: message.prompts.map { NIOSSHKeyboardInteractivePrompt(prompt: $0.prompt, echo: $0.echo) }
+        )
+        let promptCount = message.prompts.count
+
+        let promise = self.loop.makePromise(of: [String].self)
+        delegate.respondToKeyboardInteractiveChallenge(challenge, responsePromise: promise)
+
+        return promise.futureResult.flatMapThrowing { responses in
+            guard responses.count == promptCount else {
+                throw NIOSSHError.invalidKeyboardInteractiveResponse(
+                    reason: "expected \(promptCount) response(s), delegate provided \(responses.count)"
+                )
+            }
+            return SSHMessage.UserAuthInfoResponseMessage(responses: responses)
         }
     }
 }

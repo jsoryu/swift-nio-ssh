@@ -28,6 +28,15 @@ struct SSHPacketParser {
     private var state: State
     private(set) var sequenceNumber: UInt32
 
+    /// Whether a keyboard-interactive (RFC 4256) exchange is currently in progress.
+    ///
+    /// This gates the decode of message id 60, which is overloaded between `USERAUTH_PK_OK` and
+    /// `USERAUTH_INFO_REQUEST`. It is authoritative and driven by the user-auth state machine (via
+    /// the connection state machine), which sets it while awaiting an INFO_REQUEST and clears it on
+    /// the terminal SUCCESS/FAILURE. A wrong value silently corrupts the auth stream, so it must
+    /// only ever be set from the state machine, never inferred from bytes.
+    var keyboardInteractiveInProgress: Bool = false
+
     /// Testing only: the number of bytes we can discard from this buffer.
     internal var _discardableBytes: Int {
         self.buffer.readerIndex
@@ -183,7 +192,11 @@ struct SSHPacketParser {
             buffer.moveReaderIndex(forwardBy: MemoryLayout<UInt32>.size)
 
             var content = try buffer.sliceContentFromPadding()
-            guard let message = try content.readSSHMessage(), content.readableBytes == 0, buffer.readableBytes == 0
+            guard
+                let message = try content.readSSHMessage(
+                    keyboardInteractiveInProgress: self.keyboardInteractiveInProgress
+                ),
+                content.readableBytes == 0, buffer.readableBytes == 0
             else {
                 // Throw this error if the content wasn't exactly the right length for the message.
                 throw NIOSSHError.invalidPacketFormat
@@ -200,7 +213,11 @@ struct SSHPacketParser {
             }
 
             var content = try protection.decryptAndVerifyRemainingPacket(&buffer, sequenceNumber: self.sequenceNumber)
-            guard let message = try content.readSSHMessage(), content.readableBytes == 0, buffer.readableBytes == 0
+            guard
+                let message = try content.readSSHMessage(
+                    keyboardInteractiveInProgress: self.keyboardInteractiveInProgress
+                ),
+                content.readableBytes == 0, buffer.readableBytes == 0
             else {
                 // Throw this error if the content wasn't exactly the right length for the message.
                 throw NIOSSHError.invalidPacketFormat

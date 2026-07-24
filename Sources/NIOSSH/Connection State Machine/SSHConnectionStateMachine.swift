@@ -309,6 +309,13 @@ struct SSHConnectionStateMachine {
 
             case .userAuthentication(var state):
                 do {
+                    // Drive the id-60 decode gate from the authoritative user-auth state: byte 60 is
+                    // an RFC 4256 INFO_REQUEST only while a keyboard-interactive attempt is live,
+                    // otherwise it is PK_OK. Re-synced before every packet (this runs once per
+                    // message), so it always reflects the current attempt.
+                    state.parser.keyboardInteractiveInProgress =
+                        state.userAuthStateMachine.isExpectingKeyboardInteractiveInfoRequest
+
                     // In this state we tolerate receiving user auth messages.
                     guard let message = try state.parser.nextPacket() else {
                         self = .userAuthentication(state)
@@ -344,6 +351,16 @@ struct SSHConnectionStateMachine {
 
                     case .userAuthBanner(let message):
                         let result = try state.receiveUserAuthBanner(message)
+                        self = .userAuthentication(state)
+                        return result
+
+                    case .userAuthInfoRequest(let message):
+                        let result = try state.receiveUserAuthInfoRequest(message)
+                        self = .userAuthentication(state)
+                        return result
+
+                    case .userAuthInfoResponse(let message):
+                        let result = try state.receiveUserAuthInfoResponse(message)
                         self = .userAuthentication(state)
                         return result
 
@@ -973,6 +990,14 @@ struct SSHConnectionStateMachine {
 
             case .userAuthPKOK(let message):
                 try state.writeUserAuthPKOK(message, into: &buffer)
+                self.state = .userAuthentication(state)
+
+            case .userAuthInfoRequest(let message):
+                try state.writeUserAuthInfoRequest(message, into: &buffer)
+                self.state = .userAuthentication(state)
+
+            case .userAuthInfoResponse(let message):
+                try state.writeUserAuthInfoResponse(message, into: &buffer)
                 self.state = .userAuthentication(state)
 
             case .disconnect:

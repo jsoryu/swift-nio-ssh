@@ -161,6 +161,21 @@ extension NIOSSHError {
     internal static func invalidCertificate(diagnostics: String) -> NIOSSHError {
         NIOSSHError(type: .invalidCertificate, diagnostics: diagnostics)
     }
+
+    internal static let unsupportedUserAuthenticationMethod = NIOSSHError(
+        type: .unsupportedUserAuthenticationMethod,
+        diagnostics: nil
+    )
+
+    @inline(never)
+    internal static func invalidKeyboardInteractiveResponse(reason: String) -> NIOSSHError {
+        NIOSSHError(type: .invalidKeyboardInteractiveResponse, diagnostics: reason)
+    }
+
+    @inline(never)
+    internal static func keyboardInteractiveLimitsExceeded(reason: String) -> NIOSSHError {
+        NIOSSHError(type: .keyboardInteractiveLimitsExceeded, diagnostics: reason)
+    }
 }
 
 // MARK: - NIOSSHError CustomStringConvertible conformance.
@@ -207,6 +222,9 @@ extension NIOSSHError {
             case invalidHostKeyForKeyExchange
             case invalidOpenSSHPublicKey
             case invalidCertificate
+            case unsupportedUserAuthenticationMethod
+            case invalidKeyboardInteractiveResponse
+            case keyboardInteractiveLimitsExceeded
         }
 
         private var base: Base
@@ -304,6 +322,25 @@ extension NIOSSHError {
 
         /// A certificate failed validation.
         public static let invalidCertificate: ErrorType = .init(.invalidCertificate)
+
+        /// A user authentication method was requested that is not supported by the delegate.
+        ///
+        /// This is thrown, for example, when a server offers only keyboard-interactive
+        /// authentication but the client delegate does not implement a responder for it.
+        public static let unsupportedUserAuthenticationMethod: ErrorType = .init(.unsupportedUserAuthenticationMethod)
+
+        /// A keyboard-interactive (RFC 4256) response did not match the challenge.
+        ///
+        /// This is thrown when the number of responses provided does not equal the number of
+        /// prompts in the challenge, as required by RFC 4256 § 3.4.
+        public static let invalidKeyboardInteractiveResponse: ErrorType = .init(.invalidKeyboardInteractiveResponse)
+
+        /// A keyboard-interactive (RFC 4256) exchange exceeded a safety limit.
+        ///
+        /// This is thrown when a peer sends more prompts, more exchange rounds, or a larger field
+        /// than this implementation is willing to process, protecting against resource-exhaustion
+        /// attacks from a hostile or spoofed server.
+        public static let keyboardInteractiveLimitsExceeded: ErrorType = .init(.keyboardInteractiveLimitsExceeded)
     }
 }
 

@@ -118,6 +118,34 @@ extension AcceptsUserAuthMessages {
         return .event(NIOUserAuthBannerEvent(message: message.message, languageTag: message.languageTag))
     }
 
+    /// Client side: an RFC 4256 INFO_REQUEST was received; produce an INFO_RESPONSE.
+    mutating func receiveUserAuthInfoRequest(
+        _ message: SSHMessage.UserAuthInfoRequestMessage
+    ) throws -> SSHConnectionStateMachine.StateMachineInboundProcessResult {
+        let result = try self.userAuthStateMachine.receiveUserAuthInfoRequest(message)
+
+        if let future = result {
+            return .possibleFutureMessage(
+                future.map { SSHMultiMessage(.userAuthInfoResponse($0)) }
+            )
+        } else {
+            return .noMessage
+        }
+    }
+
+    /// Server side: an RFC 4256 INFO_RESPONSE was received; produce the next challenge or an outcome.
+    mutating func receiveUserAuthInfoResponse(
+        _ message: SSHMessage.UserAuthInfoResponseMessage
+    ) throws -> SSHConnectionStateMachine.StateMachineInboundProcessResult {
+        let result = try self.userAuthStateMachine.receiveUserAuthInfoResponse(message)
+
+        if let future = result {
+            return .possibleFutureMessage(future.map { Self.transform($0) })
+        } else {
+            return .noMessage
+        }
+    }
+
     private static func transform(
         _ result: NIOSSHUserAuthenticationResponseMessage,
         banner: SSHServerConfiguration.UserAuthBanner? = nil
@@ -138,6 +166,8 @@ extension AcceptsUserAuthMessages {
             return SSHMultiMessage(.userAuthFailure(message))
         case .publicKeyOK(let message):
             return SSHMultiMessage(.userAuthPKOK(message))
+        case .infoRequest(let message):
+            return SSHMultiMessage(.userAuthInfoRequest(message))
         }
     }
 
