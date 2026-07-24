@@ -95,18 +95,78 @@ extension NIOSSHPublicKey {
             return digest.withUnsafeBytes { digestPtr in
                 key.isValidSignature(sig, for: digestPtr)
             }
-        case (.rsa(let key), .rsaSHA256(let sig)):
-            return key.isValidSignature(sig, for: digest, padding: .insecurePKCS1v1_5)
-        case (.rsa(let key), .rsaSHA512(let sig)):
-            return key.isValidSignature(sig, for: digest, padding: .insecurePKCS1v1_5)
+        case (.rsa, _):
+            // RSA host-key verification is deliberately NOT reachable through this generic
+            // digest overload — doing so is the RFC 8332 non-conformance this fork fixes.
+            //
+            // RFC 8332 binds the RSA verify hash to the *negotiated* rsa-sha2 algorithm
+            // (rsa-sha2-512 → SHA-512, rsa-sha2-256 → SHA-256), treating the exchange hash
+            // H as the message. That is independent of the KEX exchange-hash width this
+            // overload sees (e.g. SHA-384 for nistp384). Verifying here would re-derive the
+            // DigestInfo OID from the wrong hash and accept the fork's own non-conformant
+            // passthrough. Fail closed: RSA host-key signatures MUST be verified via
+            // `isValidHostKeySignature(_:for:rsaAlgorithm:)`. ed25519/ECDSA are unaffected.
+            return false
         case (.certified(let key), _):
             return key.isValidSignature(signature, for: digest)
         case (.ed25519, _),
             (.ecdsaP256, _),
             (.ecdsaP384, _),
-            (.ecdsaP521, _),
-            (.rsa, _):
+            (.ecdsaP521, _):
             return false
+        }
+    }
+
+    /// Verifies a **host-key** signature over the key-exchange exchange hash (the client
+    /// side of the KEX signature), applying RFC 8332 correctly for RSA.
+    ///
+    /// This is the dedicated host-key verification seam used by the key-exchange machinery.
+    ///
+    /// - For ed25519 and ECDSA (incl. certified keys) this is identical to the generic
+    ///   digest ``isValidSignature(_:for:)`` — the exchange hash is verified as-is.
+    /// - For **RSA** it implements RFC 8332: the exchange hash `H` is treated as the
+    ///   *message* and re-hashed with the SHA-2 variant bound to the **negotiated**
+    ///   `rsa-sha2-*` algorithm (rsa-sha2-512 → `SHA-512(H)`, rsa-sha2-256 → `SHA-256(H)`)
+    ///   before the PKCS#1 v1.5 verification. The wire signature's tag must also match the
+    ///   negotiated algorithm; any mismatch (including the legacy passthrough form that
+    ///   signs `H` directly under the KEX curve's OID) is rejected.
+    ///
+    /// - Parameters:
+    ///   - signature: The signature received from the peer.
+    ///   - digest: The KEX exchange hash `H` (its *type* is the KEX curve's hash, which may
+    ///     differ from the RSA signature hash).
+    ///   - rsaAlgorithm: The negotiated RSA signature algorithm. It MUST be non-nil for an
+    ///     RSA host key (negotiation guarantees this); it is ignored for ed25519/ECDSA.
+    ///     Fail-closed: a nil value with an RSA host key rejects the signature.
+    internal func isValidHostKeySignature<DigestBytes: Digest>(
+        _ signature: NIOSSHSignature,
+        for digest: DigestBytes,
+        rsaAlgorithm: RSASignatureAlgorithm?
+    ) -> Bool {
+        switch self.backingKey {
+        case .rsa(let key):
+            guard let rsaAlgorithm else {
+                // Fail closed: an RSA host key must carry a negotiated rsa-sha2-* algorithm.
+                return false
+            }
+            // RFC 8332: re-hash the exchange-hash BYTES with the negotiated SHA-2 variant,
+            // and require the wire signature's tag to match the negotiated algorithm.
+            let exchangeHashBytes = Array(digest)
+            switch (rsaAlgorithm, signature.backingSignature) {
+            case (.sha512, .rsaSHA512(let sig)):
+                let rehashed = SHA512.hash(data: exchangeHashBytes)
+                return key.isValidSignature(sig, for: rehashed, padding: .insecurePKCS1v1_5)
+            case (.sha256, .rsaSHA256(let sig)):
+                let rehashed = SHA256.hash(data: exchangeHashBytes)
+                return key.isValidSignature(sig, for: rehashed, padding: .insecurePKCS1v1_5)
+            default:
+                // The wire signature tag disagrees with the negotiated rsa-sha2 algorithm
+                // (or is not an RSA signature at all): reject.
+                return false
+            }
+        case .ed25519, .ecdsaP256, .ecdsaP384, .ecdsaP521, .certified:
+            // Non-RSA host keys: identical to the generic digest verification.
+            return self.isValidSignature(signature, for: digest)
         }
     }
 

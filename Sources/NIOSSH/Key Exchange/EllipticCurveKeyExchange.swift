@@ -34,14 +34,16 @@ protocol EllipticCurveKeyExchangeProtocol: _NIOSSHSendableMetatype {
         serverHostKey: NIOSSHPrivateKey,
         initialExchangeBytes: inout ByteBuffer,
         allocator: ByteBufferAllocator,
-        expectedKeySizes: ExpectedKeySizes
+        expectedKeySizes: ExpectedKeySizes,
+        rsaHostKeyAlgorithm: RSASignatureAlgorithm?
     ) throws -> (KeyExchangeResult, SSHMessage.KeyExchangeECDHReplyMessage)
 
     mutating func receiveServerKeyExchangePayload(
         serverKeyExchangeMessage message: SSHMessage.KeyExchangeECDHReplyMessage,
         initialExchangeBytes: inout ByteBuffer,
         allocator: ByteBufferAllocator,
-        expectedKeySizes: ExpectedKeySizes
+        expectedKeySizes: ExpectedKeySizes,
+        rsaHostKeyAlgorithm: RSASignatureAlgorithm?
     ) throws -> KeyExchangeResult
 
     static var keyExchangeAlgorithmNames: [Substring] { get }
@@ -92,7 +94,8 @@ extension EllipticCurveKeyExchange {
         serverHostKey: NIOSSHPrivateKey,
         initialExchangeBytes: inout ByteBuffer,
         allocator: ByteBufferAllocator,
-        expectedKeySizes: ExpectedKeySizes
+        expectedKeySizes: ExpectedKeySizes,
+        rsaHostKeyAlgorithm: RSASignatureAlgorithm? = nil
     ) throws -> (KeyExchangeResult, SSHMessage.KeyExchangeECDHReplyMessage) {
         precondition(self.ourRole.isServer, "Only servers may receive a client key exchange packet!")
 
@@ -105,8 +108,13 @@ extension EllipticCurveKeyExchange {
             expectedKeySizes: expectedKeySizes
         )
 
-        // We should now sign the exchange hash.
-        let exchangeHashSignature = try serverHostKey.sign(digest: kexResult.exchangeHash)
+        // We should now sign the exchange hash. For RSA host keys this re-hashes the
+        // exchange hash with the negotiated rsa-sha2 SHA-2 variant (RFC 8332); for
+        // ed25519/ECDSA the negotiated algorithm is ignored and the hash is signed as-is.
+        let exchangeHashSignature = try serverHostKey.signForHostKeyExchange(
+            digest: kexResult.exchangeHash,
+            rsaAlgorithm: rsaHostKeyAlgorithm
+        )
 
         // Ok, time to write the final message. We need to write our public key into it.
         // The largest key we're likely to end up with here is 256 bytes.
@@ -136,7 +144,8 @@ extension EllipticCurveKeyExchange {
         serverKeyExchangeMessage message: SSHMessage.KeyExchangeECDHReplyMessage,
         initialExchangeBytes: inout ByteBuffer,
         allocator: ByteBufferAllocator,
-        expectedKeySizes: ExpectedKeySizes
+        expectedKeySizes: ExpectedKeySizes,
+        rsaHostKeyAlgorithm: RSASignatureAlgorithm? = nil
     ) throws -> KeyExchangeResult {
         precondition(self.ourRole.isClient, "Only clients may receive a server key exchange packet!")
 
@@ -157,8 +166,17 @@ extension EllipticCurveKeyExchange {
             expectedKeySizes: expectedKeySizes
         )
 
-        // We can now verify signature over the exchange hash.
-        guard message.hostKey.isValidSignature(message.signature, for: kexResult.exchangeHash) else {
+        // We can now verify signature over the exchange hash. For RSA host keys this
+        // re-hashes the exchange hash with the negotiated rsa-sha2 SHA-2 variant and
+        // requires the wire signature tag to match it (RFC 8332); for ed25519/ECDSA the
+        // negotiated algorithm is ignored and the hash is verified as-is.
+        guard
+            message.hostKey.isValidHostKeySignature(
+                message.signature,
+                for: kexResult.exchangeHash,
+                rsaAlgorithm: rsaHostKeyAlgorithm
+            )
+        else {
             throw NIOSSHError.invalidExchangeHashSignature
         }
 

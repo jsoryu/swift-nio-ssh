@@ -257,7 +257,13 @@ struct SSHKeyExchangeStateMachine {
                     serverHostKey: negotiated.negotiatedHostKey(configuration.hostKeys),
                     initialExchangeBytes: &self.initialExchangeBytes,
                     allocator: self.allocator,
-                    expectedKeySizes: negotiated.negotiatedProtection.keySizes
+                    expectedKeySizes: negotiated.negotiatedProtection.keySizes,
+                    // RFC 8332: bind the RSA host-key signature hash to the negotiated
+                    // rsa-sha2 algorithm. `nil` for non-RSA host keys (the name maps to no
+                    // RSASignatureAlgorithm), which leaves ed25519/ECDSA signing unchanged.
+                    rsaHostKeyAlgorithm: RSASignatureAlgorithm(
+                        algorithmName: negotiated.negotiatedHostKeyAlgorithm.utf8
+                    )
                 )
 
                 let message = SSHMessage.keyExchangeReply(reply)
@@ -305,7 +311,13 @@ struct SSHKeyExchangeStateMachine {
                     serverKeyExchangeMessage: message,
                     initialExchangeBytes: &self.initialExchangeBytes,
                     allocator: self.allocator,
-                    expectedKeySizes: negotiated.negotiatedProtection.keySizes
+                    expectedKeySizes: negotiated.negotiatedProtection.keySizes,
+                    // RFC 8332: bind the RSA host-key verify hash to the negotiated
+                    // rsa-sha2 algorithm. `nil` for non-RSA host keys (the name maps to no
+                    // RSASignatureAlgorithm), which leaves ed25519/ECDSA verify unchanged.
+                    rsaHostKeyAlgorithm: RSASignatureAlgorithm(
+                        algorithmName: negotiated.negotiatedHostKeyAlgorithm.utf8
+                    )
                 )
 
                 self.state = .keysExchanged(

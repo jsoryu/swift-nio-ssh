@@ -129,18 +129,27 @@ extension NIOSSHPrivateKey {
                 try key.signature(for: ptr)
             }
             return NIOSSHSignature(backingSignature: .ecdsaP521(signature))
-        case .rsa(let key):
-            // RSA signs the digest directly with PKCS#1 v1.5 padding (RFC 8332). The
-            // signature-algorithm tag follows the digest width; SHA-1 is never emitted.
-            let signature = try key.signature(for: digest, padding: .insecurePKCS1v1_5)
-            switch DigestBytes.byteCount {
-            case SHA256.byteCount:
-                return NIOSSHSignature(backingSignature: .rsaSHA256(signature))
-            default:
-                // SHA-512, or any other width (e.g. SHA-384, which has no SSH RSA name):
-                // fall back to the strongest available, rsa-sha2-512.
-                return NIOSSHSignature(backingSignature: .rsaSHA512(signature))
-            }
+        case .rsa:
+            // RSA host-key signing is deliberately NOT reachable through this generic
+            // digest overload — doing so is the RFC 8332 non-conformance this fork fixes.
+            //
+            // RFC 8332 requires the RSA signature hash to be the one bound to the
+            // *negotiated* rsa-sha2 algorithm (rsa-sha2-512 → SHA-512, rsa-sha2-256 →
+            // SHA-256), treating the exchange hash H as the message. That negotiated
+            // algorithm is independent of the KEX exchange-hash's own width: e.g. an
+            // ecdh-sha2-nistp384 exchange yields a SHA-384 `Digest` here, which must NOT
+            // dictate the RSA hash. This overload only sees the `Digest` (whose *type* is
+            // the KEX curve's hash), so it cannot know the negotiated algorithm — signing
+            // here would derive the PKCS#1 DigestInfo OID from the wrong hash and mis-tag
+            // the wire signature (self-consistent fork↔fork but rejected by OpenSSH).
+            //
+            // Fail closed: RSA host-key signatures MUST go through
+            // `signForHostKeyExchange(digest:rsaAlgorithm:)`, which re-hashes the exchange
+            // hash with the negotiated SHA-2 variant. ed25519/ECDSA are unaffected.
+            throw NIOSSHError.invalidHostKeyForKeyExchange(
+                expected: "rsa-sha2-512 or rsa-sha2-256",
+                got: self.publicKey.keyPrefix
+            )
 
         #if canImport(Darwin)
         case .secureEnclaveP256(let key):
@@ -188,6 +197,64 @@ extension NIOSSHPrivateKey {
             let signature = try key.signature(for: payload.bytes.readableBytesView)
             return NIOSSHSignature(backingSignature: .ecdsaP256(signature))
         #endif
+        }
+    }
+}
+
+extension NIOSSHPrivateKey {
+    /// Signs the key-exchange exchange hash for **host-key** authentication (the server
+    /// side of the KEX signature), applying RFC 8332 correctly for RSA.
+    ///
+    /// This is the dedicated host-key signing seam used by the key-exchange machinery.
+    ///
+    /// - For ed25519 and ECDSA (incl. Secure Enclave) this is byte-for-byte identical to
+    ///   the generic ``sign(digest:)`` — the exchange hash is signed as-is.
+    /// - For **RSA** it implements RFC 8332: the exchange hash `H` is treated as the
+    ///   *message* and re-hashed with the SHA-2 variant bound to the **negotiated**
+    ///   `rsa-sha2-*` algorithm (rsa-sha2-512 → `SHA-512(H)`, rsa-sha2-256 → `SHA-256(H)`).
+    ///   The signature is then produced with PKCS#1 v1.5 padding, so the DigestInfo carries
+    ///   the SHA-512/SHA-256 OID as required, and the wire signature is tagged by the
+    ///   negotiated algorithm — never by the width of the KEX curve's hash. `ssh-rsa`/SHA-1
+    ///   is unreachable.
+    ///
+    /// - Parameters:
+    ///   - digest: The KEX exchange hash `H`. Its *type* is the KEX curve's hash (e.g.
+    ///     SHA-384 for ecdh-sha2-nistp384), which may differ from the RSA signature hash —
+    ///     that difference is exactly what RFC 8332 resolves by re-hashing `H`.
+    ///   - rsaAlgorithm: The negotiated RSA signature algorithm. It MUST be non-nil for an
+    ///     RSA host key (negotiation guarantees this); it is ignored for ed25519/ECDSA.
+    ///     Fail-closed: a nil value with an RSA host key throws rather than guessing a hash.
+    func signForHostKeyExchange<DigestBytes: Digest>(
+        digest: DigestBytes,
+        rsaAlgorithm: RSASignatureAlgorithm?
+    ) throws -> NIOSSHSignature {
+        guard case .rsa(let key) = self.backingKey else {
+            // ed25519 / ECDSA (incl. Secure Enclave): unchanged generic digest signature.
+            return try self.sign(digest: digest)
+        }
+
+        guard let rsaAlgorithm else {
+            // Fail closed: an RSA host key must carry a negotiated rsa-sha2-* algorithm.
+            throw NIOSSHError.invalidHostKeyForKeyExchange(
+                expected: "rsa-sha2-512 or rsa-sha2-256",
+                got: self.publicKey.keyPrefix
+            )
+        }
+
+        // RFC 8332: re-hash the exchange-hash BYTES with the negotiated SHA-2 variant so
+        // the PKCS#1 DigestInfo OID matches the wire tag, then sign. PKCS#1 v1.5 is
+        // deterministic, so this is byte-identical to a swift-crypto reference signature
+        // over the same re-hashed digest.
+        let exchangeHashBytes = Array(digest)
+        switch rsaAlgorithm {
+        case .sha512:
+            let rehashed = SHA512.hash(data: exchangeHashBytes)
+            let signature = try key.signature(for: rehashed, padding: .insecurePKCS1v1_5)
+            return NIOSSHSignature(backingSignature: .rsaSHA512(signature))
+        case .sha256:
+            let rehashed = SHA256.hash(data: exchangeHashBytes)
+            let signature = try key.signature(for: rehashed, padding: .insecurePKCS1v1_5)
+            return NIOSSHSignature(backingSignature: .rsaSHA256(signature))
         }
     }
 }

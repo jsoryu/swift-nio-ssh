@@ -576,6 +576,12 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
         // throw `NIOSSHError.invalidExchangeHashSignature` and this handshake would not
         // complete. The server here advertises only rsa-sha2-512/rsa-sha2-256, so a
         // successful handshake means the client selected and verified an RSA host key.
+        //
+        // Both peers prefer ecdh-sha2-nistp384, so the exchange hash H is a SHA-384 digest
+        // while the negotiated host-key algorithm is rsa-sha2-512. This is precisely the
+        // divergent-hash case RFC 8332 governs: the signature must be RSA(SHA-512-OID,
+        // SHA-512(H)), not the old passthrough over H under the SHA-384 OID. A completed
+        // handshake now proves both sides agree on the RFC 8332-correct construction.
         let rsaKey = try _RSA.Signing.PrivateKey(keySize: .bits2048)
         try self.straightforwardCustomHostKeyHandshake(hostKey: .init(rsaKey: rsaKey))
     }
