@@ -13,12 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 import Crypto
-import Dispatch
 import NIOCore
-
-#if canImport(CDispatch)
-import CDispatch
-#endif
 
 #if canImport(FoundationEssentials)
 import FoundationEssentials
@@ -317,12 +312,15 @@ extension NIOSSHCertifiedPublicKey {
             throw NIOSSHError.invalidCertificate(diagnostics: "Certificate is not valid for this principal")
         }
 
-        // This can only be negative if we're in a terribly misconfigured system, so we can safely just turn this directly
-        // into a UInt64.
-        let now = DispatchWallTime.now()
-        let validAfter = DispatchWallTime(secondsSinceEpoch: self.validAfter)
-        let validBefore = DispatchWallTime(secondsSinceEpoch: self.validBefore)
-        guard validAfter <= now, validBefore > now else {
+        // Check that "now" falls within the validity window [validAfter, validBefore]. The
+        // bounds are UInt64 seconds-since-epoch: ssh-keygen writes validBefore == UInt64.max
+        // for a certificate that never expires and validAfter == 0 for one valid "from the
+        // beginning". The comparison is done in integer seconds (see isValid(nowSeconds:))
+        // rather than via DispatchWallTime: converting UInt64.max to time_t (Int64) overflows
+        // and traps the process — a crash on ordinary forever-certificates and a client-side
+        // denial of service when validating a hostile host certificate — while libdispatch's
+        // internal "now" sentinel additionally misreads the epoch (0) as the current instant.
+        guard self.isValid(nowSeconds: UInt64(max(0, time(nil)))) else {
             throw NIOSSHError.invalidCertificate(diagnostics: "Certificate is no longer valid")
         }
 
@@ -836,9 +834,18 @@ extension ByteBuffer {
     }
 }
 
-extension DispatchWallTime {
-    init(secondsSinceEpoch: UInt64) {
-        let t = timespec(tv_sec: time_t(secondsSinceEpoch), tv_nsec: 0)
-        self = DispatchWallTime(timespec: t)
+extension NIOSSHCertifiedPublicKey {
+    /// Whether `nowSeconds` (whole seconds since the Unix epoch) falls within this
+    /// certificate's `[validAfter, validBefore]` validity window.
+    ///
+    /// The comparison is pure `UInt64` integer arithmetic on the raw certificate bounds, so it
+    /// is safe across the entire representable range — including the two values `ssh-keygen`
+    /// emits for open-ended windows: `validBefore == UInt64.max` ("never expires", so any real
+    /// `now` is strictly before it) and `validAfter == 0` ("valid from the beginning", so any
+    /// real `now` is at or after it). It never constructs a `DispatchWallTime`, avoiding the
+    /// `UInt64 -> time_t` overflow trap on far-future bounds and libdispatch's "now" sentinel
+    /// on the epoch.
+    internal func isValid(nowSeconds: UInt64) -> Bool {
+        self.validAfter <= nowSeconds && nowSeconds < self.validBefore
     }
 }
