@@ -349,6 +349,23 @@ extension NIOSSHCertifiedPublicKey {
 
     static let ed25519KeyPrefix = "ssh-ed25519-cert-v01@openssh.com".utf8
 
+    /// The certified-key *blob* prefix for an RSA base key (`ssh-rsa-cert-v01@openssh.com`).
+    ///
+    /// This is the key-format identifier written into the certificate blob (mirroring the
+    /// plain `ssh-rsa` key-blob prefix). Per RFC 8332 it is NOT a user-auth signature
+    /// algorithm name — those are the `rsa-sha2-{256,512}-cert-v01@openssh.com` names below.
+    static let rsaCertPrefix = "ssh-rsa-cert-v01@openssh.com".utf8
+
+    /// The `rsa-sha2-256-cert-v01@openssh.com` user-auth signature-algorithm name.
+    ///
+    /// This is the cert-variant of the plain `rsa-sha2-256` name (RFC 8332 +
+    /// PROTOCOL.certkeys): it authenticates an RSA *certificate* in user-auth while the
+    /// key blob keeps the `ssh-rsa-cert-v01@openssh.com` prefix.
+    static let rsaSHA256CertAlgorithmName = "rsa-sha2-256-cert-v01@openssh.com".utf8
+
+    /// The `rsa-sha2-512-cert-v01@openssh.com` user-auth signature-algorithm name.
+    static let rsaSHA512CertAlgorithmName = "rsa-sha2-512-cert-v01@openssh.com".utf8
+
     internal var keyPrefix: String.UTF8View {
         switch self.key.backingKey {
         case .ed25519:
@@ -360,9 +377,9 @@ extension NIOSSHCertifiedPublicKey {
         case .ecdsaP521:
             return Self.p521KeyPrefix
         case .rsa:
-            // RSA certificates are out of scope; SSHCertificate parsing rejects RSA
-            // certs before this point, so this arm is unreachable.
-            preconditionFailure("RSA certificates are not currently supported")
+            // The certificate blob prefix for an RSA base key. This is the key-blob tag
+            // only; the user-auth signature name is an rsa-sha2-*-cert-v01 name (below).
+            return Self.rsaCertPrefix
         case .certified:
             preconditionFailure("base key cannot be certified")
         }
@@ -371,7 +388,10 @@ extension NIOSSHCertifiedPublicKey {
     /// The user-auth signature-algorithm prefix for a certified key's base key.
     ///
     /// Mirrors ``NIOSSHPublicKey/signatureAlgorithmPrefix`` so that certified keys can
-    /// delegate to their base key. RSA certificates are unsupported.
+    /// delegate to their base key. For an RSA base key this returns the default
+    /// `rsa-sha2-512-cert-v01@openssh.com` name; use ``algorithmName(forRSA:)`` to pick a
+    /// specific RSA algorithm. As with plain RSA, the signature name decouples from the
+    /// `ssh-rsa-cert-v01@openssh.com` key-blob prefix (RFC 8332).
     internal var signatureAlgorithmPrefix: String.UTF8View {
         switch self.key.backingKey {
         case .ed25519:
@@ -383,7 +403,7 @@ extension NIOSSHCertifiedPublicKey {
         case .ecdsaP521:
             return Self.p521KeyPrefix
         case .rsa:
-            preconditionFailure("RSA certificates are not currently supported")
+            return Self.rsaSHA512CertAlgorithmName
         case .certified:
             preconditionFailure("base key cannot be certified")
         }
@@ -391,11 +411,21 @@ extension NIOSSHCertifiedPublicKey {
 
     /// Returns the user-auth algorithm name for a certified key, honouring the RSA choice.
     ///
-    /// RSA certificates are unsupported, so this always returns ``signatureAlgorithmPrefix``.
+    /// For an RSA base key this returns the cert-variant signature name for `rsaAlgorithm`
+    /// (`rsa-sha2-256-cert-v01@openssh.com` / `rsa-sha2-512-cert-v01@openssh.com`); for
+    /// every other base-key type `rsaAlgorithm` is ignored and ``signatureAlgorithmPrefix``
+    /// is returned. This is the seam that lets the certificate's signature/user-auth
+    /// algorithm name differ from the `ssh-rsa-cert-v01@openssh.com` key-blob prefix. There
+    /// is deliberately no `ssh-rsa-cert-v01` (SHA-1) signature name.
     internal func algorithmName(forRSA rsaAlgorithm: RSASignatureAlgorithm) -> String.UTF8View {
         switch self.key.backingKey {
         case .rsa:
-            preconditionFailure("RSA certificates are not currently supported")
+            switch rsaAlgorithm {
+            case .sha256:
+                return Self.rsaSHA256CertAlgorithmName
+            case .sha512:
+                return Self.rsaSHA512CertAlgorithmName
+            }
         default:
             return self.signatureAlgorithmPrefix
         }
@@ -413,6 +443,24 @@ extension NIOSSHCertifiedPublicKey {
         self.key.isValidSignature(signature, for: payload)
     }
 
+    /// Maps a cert-variant user-auth signature-algorithm name to its ``RSASignatureAlgorithm``.
+    ///
+    /// Recognises only `rsa-sha2-256-cert-v01@openssh.com` and
+    /// `rsa-sha2-512-cert-v01@openssh.com`. Any other name — including the SHA-1
+    /// `ssh-rsa-cert-v01@openssh.com` key-blob prefix — returns `nil`, so SHA-1 RSA
+    /// certificate signatures are refused at the negotiation edge rather than downgraded.
+    internal static func rsaCertSignatureAlgorithm<Bytes: Collection>(
+        algorithmName bytes: Bytes
+    ) -> RSASignatureAlgorithm? where Bytes.Element == UInt8 {
+        if bytes.elementsEqual(Self.rsaSHA256CertAlgorithmName) {
+            return .sha256
+        } else if bytes.elementsEqual(Self.rsaSHA512CertAlgorithmName) {
+            return .sha512
+        } else {
+            return nil
+        }
+    }
+
     internal static func baseKeyPrefixForKeyPrefix<Bytes: Collection>(_ prefix: Bytes) throws -> String.UTF8View
     where Bytes.Element == UInt8 {
         if prefix.elementsEqual(Self.ed25519KeyPrefix) {
@@ -423,6 +471,12 @@ extension NIOSSHCertifiedPublicKey {
             return NIOSSHPublicKey.ecdsaP384PublicKeyPrefix
         } else if prefix.elementsEqual(Self.p521KeyPrefix) {
             return NIOSSHPublicKey.ecdsaP521PublicKeyPrefix
+        } else if prefix.elementsEqual(Self.rsaCertPrefix) {
+            // The RSA certificate's base key is a plain `ssh-rsa` public key: the same
+            // `mpint e`, `mpint n` wire shape, read via the standard RSA reader (which
+            // enforces the 2048-bit modulus floor). SHA-1 is never involved: this is a
+            // key-blob prefix, not a signature-algorithm name.
+            return NIOSSHPublicKey.rsaPublicKeyPrefix
         } else {
             throw NIOSSHError.unknownPublicKey(algorithm: String(decoding: prefix, as: UTF8.self))
         }

@@ -346,9 +346,15 @@ extension NIOSSHPublicKey {
         // NOT the ssh-rsa key prefix: the user-auth "public key algorithm name" field
         // carries the signature name. Omitting ssh-rsa here means a SHA-1 request is
         // treated as unknown and refused.
+        //
+        // For RSA *certificates* we register the cert-variant signature names
+        // (rsa-sha2-256/512-cert-v01@openssh.com), NOT the ssh-rsa-cert-v01 key-blob
+        // prefix: exactly the same name/prefix decoupling as plain RSA. Omitting
+        // ssh-rsa-cert-v01 here means a SHA-1 certificate signature name is refused.
         [
             Self.ed25519PublicKeyPrefix, Self.ecdsaP384PublicKeyPrefix, Self.ecdsaP256PublicKeyPrefix,
             Self.ecdsaP521PublicKeyPrefix, Self.rsaSHA256AlgorithmName, Self.rsaSHA512AlgorithmName,
+            NIOSSHCertifiedPublicKey.rsaSHA256CertAlgorithmName, NIOSSHCertifiedPublicKey.rsaSHA512CertAlgorithmName,
         ]
     }
 }

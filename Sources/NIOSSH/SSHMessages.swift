@@ -768,6 +768,9 @@ extension ByteBuffer {
                     // rejected here regardless of the earlier knownAlgorithms filter.
                     let algorithmNameView = algorithmName.readableBytesView
                     let rsaSignatureAlgorithm = RSASignatureAlgorithm(algorithmName: algorithmNameView)
+                    let rsaCertSignatureAlgorithm = NIOSSHCertifiedPublicKey.rsaCertSignatureAlgorithm(
+                        algorithmName: algorithmNameView
+                    )
                     let algorithmMatchesKey: Bool
                     if publicKey.keyPrefix.elementsEqual(NIOSSHPublicKey.rsaPublicKeyPrefix) {
                         // RSA (RFC 8332): the key-blob prefix is "ssh-rsa" but the user-auth
@@ -778,6 +781,12 @@ extension ByteBuffer {
                         // gate. Checking the RSA key prefix first also prevents the general
                         // name-equals-prefix branch from ever accepting an "ssh-rsa" name.
                         algorithmMatchesKey = rsaSignatureAlgorithm != nil
+                    } else if publicKey.keyPrefix.elementsEqual(NIOSSHCertifiedPublicKey.rsaCertPrefix) {
+                        // RSA certificate (RFC 8332 + PROTOCOL.certkeys): same decoupling as
+                        // plain RSA. The key-blob prefix is "ssh-rsa-cert-v01@openssh.com" but
+                        // the user-auth name MUST be an rsa-sha2-*-cert-v01 name. Gating on a
+                        // non-nil cert algorithm rejects the SHA-1 "ssh-rsa-cert-v01" name here.
+                        algorithmMatchesKey = rsaCertSignatureAlgorithm != nil
                     } else if algorithmNameView.elementsEqual(publicKey.keyPrefix) {
                         // Every non-RSA key type uses an algorithm name equal to its key prefix.
                         algorithmMatchesKey = true
@@ -789,8 +798,9 @@ extension ByteBuffer {
                     }
 
                     // Default to rsa-sha2-512 if the key is RSA but the name was somehow
-                    // absent; irrelevant for non-RSA keys.
-                    let rsaAlgorithm = rsaSignatureAlgorithm ?? .sha512
+                    // absent; irrelevant for non-RSA keys. For an RSA certificate the
+                    // cert-variant name carries the negotiated hash.
+                    let rsaAlgorithm = rsaSignatureAlgorithm ?? rsaCertSignatureAlgorithm ?? .sha512
 
                     if expectSignature {
                         guard var signatureBytes = self.readSSHString(),
@@ -877,6 +887,10 @@ extension ByteBuffer {
                 keyTypeMatches = true
             } else if publicKey.keyPrefix.elementsEqual(NIOSSHPublicKey.rsaPublicKeyPrefix) {
                 keyTypeMatches = RSASignatureAlgorithm(algorithmName: publicKeyTypeView) != nil
+            } else if publicKey.keyPrefix.elementsEqual(NIOSSHCertifiedPublicKey.rsaCertPrefix) {
+                // RSA certificate: the rsa-sha2-*-cert-v01 signature name decouples from the
+                // ssh-rsa-cert-v01 key-blob prefix (RFC 8332); SHA-1 is refused (nil).
+                keyTypeMatches = NIOSSHCertifiedPublicKey.rsaCertSignatureAlgorithm(algorithmName: publicKeyTypeView) != nil
             } else {
                 keyTypeMatches = false
             }
